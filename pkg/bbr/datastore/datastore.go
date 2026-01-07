@@ -33,7 +33,7 @@ const (
 	adaptersKey  = "adapters"
 )
 
-// The bbr datastore stores a mapping between a LoRA adapter and its corresponding base model.
+// Datastore stores a mapping between a LoRA adapter and its corresponding base model.
 // Each ConfigMap object stores a mapping between base model and a set of LoRA adapters and datastore translates this into an in-memory cache.
 // In case the number of LoRA adapters is extremely large, it's possible to use multiple ConfigMap objects, each storing a slice of the mapping.
 // Base models are stored in a separate hash map, due to the fact that the same base model can have multiple configmap objects
