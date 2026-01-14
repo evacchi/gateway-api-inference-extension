@@ -1167,10 +1167,12 @@ func TestFlowRegistry_PriorityBandGarbageCollection(t *testing.T) {
 		state := val.(*priorityBandState)
 
 		// Verify band is idle
-		idleTime := state.becameIdleAt.Load()
-		require.NotNil(t, idleTime, "Band should be idle")
+		state.mu.Lock()
+		idleTime := state.becameIdleAt
+		state.mu.Unlock()
+		require.False(t, idleTime.IsZero(), "Band should be idle")
 
-		// Start GC and create new flow concurrently - the lock-free implementation
+		// Start GC and create new flow concurrently - the mutex-protected implementation
 		// should handle this race correctly via leaseCount verification
 		var wg sync.WaitGroup
 		wg.Add(2)
@@ -1195,8 +1197,12 @@ func TestFlowRegistry_PriorityBandGarbageCollection(t *testing.T) {
 		h.fr.mu.RUnlock()
 
 		if exists {
-			// Band survived - verify it has a flow
-			require.NotNil(t, state.leaseCount.Load() > 0 || idleTime != state.becameIdleAt.Load(),
+			// Band survived - verify it has a flow or was reset
+			state.mu.Lock()
+			hasFlows := state.leaseCount > 0
+			wasReset := state.becameIdleAt != idleTime
+			state.mu.Unlock()
+			require.True(t, hasFlows || wasReset,
 				"If band exists, it should either have flows or have been reset")
 		}
 	})
@@ -1214,26 +1220,70 @@ func TestFlowRegistry_PriorityBandGarbageCollection(t *testing.T) {
 		require.True(t, ok, "Band state should exist")
 		state := val.(*priorityBandState)
 
-		isIdle := state.becameIdleAt.Load()
-		assert.Nil(t, isIdle, "Band should NOT be idle when it has flows")
-		assert.Greater(t, state.leaseCount.Load(), int64(0), "Band should have positive lease count")
+		state.mu.Lock()
+		assert.True(t, state.becameIdleAt.IsZero(), "Band should NOT be idle when it has flows")
+		assert.Greater(t, state.leaseCount, 0, "Band should have positive lease count")
+		state.mu.Unlock()
 
 		// Collect the flow
 		h.fakeClock.Step(h.config.FlowGCTimeout + time.Second)
 		h.fr.executeGCCycle()
 
 		// Verify band is now idle (becameIdleAt is set)
-		idleTime := state.becameIdleAt.Load()
-		assert.NotNil(t, idleTime, "Band should be idle after flow is collected")
-		assert.Equal(t, int64(0), state.leaseCount.Load(), "Band should have zero lease count")
+		state.mu.Lock()
+		assert.False(t, state.becameIdleAt.IsZero(), "Band should be idle after flow is collected")
+		assert.Equal(t, 0, state.leaseCount, "Band should have zero lease count")
+		state.mu.Unlock()
 
 		// Add a new flow (should reset idle state)
 		key2 := types.FlowKey{ID: "new-flow", Priority: dynamicPrio}
 		h.openConnectionOnFlow(key2)
 
 		// Verify band is no longer idle
-		newIdleTime := state.becameIdleAt.Load()
-		assert.Nil(t, newIdleTime, "Band should NOT be idle after new flow arrives")
-		assert.Greater(t, state.leaseCount.Load(), int64(0), "Band should have positive lease count after new flow")
+		state.mu.Lock()
+		assert.True(t, state.becameIdleAt.IsZero(), "Band should NOT be idle after new flow arrives")
+		assert.Greater(t, state.leaseCount, 0, "Band should have positive lease count after new flow")
+		state.mu.Unlock()
+	})
+
+	t.Run("ShouldNotIncrementLeaseCount_WhenBandIsMarkedForDeletion", func(t *testing.T) {
+		t.Parallel()
+		h := newRegistryTestHarness(t, harnessOptions{})
+		key1 := types.FlowKey{ID: "initial-flow", Priority: dynamicPrio}
+		key2 := types.FlowKey{ID: "doomed-flow", Priority: dynamicPrio}
+
+		// Create initial flow to provision the band
+		h.openConnectionOnFlow(key1)
+
+		// Collect the flow to make band idle
+		h.fakeClock.Step(h.config.FlowGCTimeout + time.Second)
+		h.fr.executeGCCycle()
+
+		// Get the band state
+		val, ok := h.fr.priorityBandStates.Load(dynamicPrio)
+		require.True(t, ok, "Band state should exist")
+		originalBandState := val.(*priorityBandState)
+
+		// Manually mark it for deletion (simulate GC step)
+		originalBandState.mu.Lock()
+		originalBandState.markedForDeletion = true
+		originalLeaseCount := originalBandState.leaseCount
+		originalBandState.mu.Unlock()
+
+		// Try to create a new flow at this priority
+		h.openConnectionOnFlow(key2)
+
+		// Verify that the lease count was NOT incremented
+		originalBandState.mu.Lock()
+		assert.Equal(t, originalLeaseCount, originalBandState.leaseCount,
+			"Lease count should not be incremented on band marked for deletion")
+		originalBandState.mu.Unlock()
+
+		// The flow should have been provisioned successfully (queues created, etc.)
+		// but the band state tracking was skipped
+		err := h.fr.WithConnection(key2, func(c contracts.ActiveFlowConnection) error {
+			return nil
+		})
+		require.NoError(t, err, "Flow should be usable even if band state was marked for deletion")
 	})
 }

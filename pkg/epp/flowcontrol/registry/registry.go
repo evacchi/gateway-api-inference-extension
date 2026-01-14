@@ -330,8 +330,12 @@ func (fr *FlowRegistry) ensureFlowInfrastructure(key types.FlowKey) error {
 	if val, ok := fr.priorityBandStates.Load(key.Priority); ok {
 		bandState := val.(*priorityBandState)
 		bandState.mu.Lock()
-		bandState.leaseCount++
-		bandState.becameIdleAt = time.Time{} // Mark band as active
+		if !bandState.markedForDeletion {
+			bandState.leaseCount++
+			bandState.becameIdleAt = time.Time{} // Mark band as active
+		}
+		// If marked for deletion, the band state will be GC'd and a new one will be created on next flow.
+		// We don't increment to avoid leaking the count on a dying state object.
 		bandState.mu.Unlock()
 	}
 
