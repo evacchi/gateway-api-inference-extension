@@ -102,18 +102,31 @@ func (p *weightedDeficitRoundRobin) NewState(_ context.Context) any {
 }
 
 // Pick implements the WDRR selection algorithm.
-// It retrieves the band-specific state, locks it, and selects the flow with the highest deficit.
+// It retrieves the band-specific state, locks it, and selects a flow using weighted deficit round-robin.
 //
 // Algorithm:
 //  1. Sort flow keys for deterministic iteration order
-//  2. For each non-empty queue:
-//     a. Refill deficit (add quantum) if deficit is depleted (≤0), capping at MaxDeficit
-//     b. Track the flow with the highest deficit
-//  3. Select the flow with the highest deficit and deduct 1 unit from its deficit
-//  4. If no flow selected, clean up deficits for flows no longer in the band
+//  2. If the last selected flow still has positive deficit and is non-empty:
+//     a. Continue serving from it (deduct 1 from deficit and return)
+//  3. Otherwise, advance to next flow in round-robin order:
+//     a. Find starting position (after last selected flow)
+//     b. Find the next non-empty queue
+//     c. Refill its deficit with quantum (quantum = BaseQuantum * weight)
+//     d. Select it (deduct 1 from deficit and return)
+//  4. If no non-empty queue found, clean up deficits for inactive flows
+//
+// Anti-starvation mechanism:
+//   - Round-robin iteration ensures all flows are visited in bounded time
+//   - Each flow gets quantum credits when selected (quantum = BaseQuantum * weight)
+//   - Higher-weight flows serve more items per round (larger quantum)
+//   - Even weight=1 flows get MinQuantum guarantee
+//
+// Weighted fairness:
+//   - Flow with weight W serves W*BaseQuantum items per round
+//   - Long-term ratio matches weight ratio (e.g., 10:5:1 weights → 62.5%:31.25%:6.25% distribution)
 //
 // Returns:
-//   - FlowQueueAccessor: The selected queue, or nil if no queue is suitable
+//   - FlowQueueAccessor: The selected queue, or nil if all queues are empty
 //   - error: Error if state type is invalid, nil otherwise
 func (p *weightedDeficitRoundRobin) Pick(
 	_ context.Context,
@@ -142,40 +155,52 @@ func (p *weightedDeficitRoundRobin) Pick(
 	}
 	slices.SortFunc(keys, func(a, b types.FlowKey) int { return a.Compare(b) })
 
-	// Iterate through flows to refill depleted deficits and find the flow with highest deficit
-	maxDeficit := int64(0)
-	found := false
-	maxKey := types.FlowKey{}
-	for _, key := range keys {
+	// First, check if lastSelected flow still has deficit and is non-empty
+	// Stay on the current flow until its deficit is depleted (classic DRR behavior)
+	if state.lastSelected != nil {
+		queue := band.Queue(state.lastSelected.ID)
+		if queue != nil && queue.Len() > 0 {
+			deficit := state.deficits[state.lastSelected.ID]
+			if deficit > 0 {
+				// Continue serving from this flow
+				state.deficits[state.lastSelected.ID]--
+				return queue, nil
+			}
+		}
+	}
+
+	// Current flow depleted or empty, advance to next flow in round-robin order
+	// Find starting index (after lastSelected)
+	startIdx := 0
+	if state.lastSelected != nil {
+		for i, k := range keys {
+			if k.ID == state.lastSelected.ID {
+				startIdx = (i + 1) % len(keys)
+				break
+			}
+		}
+	}
+
+	// Iterate through flows in round-robin order to find the next non-empty flow
+	for i := 0; i < len(keys); i++ {
+		idx := (startIdx + i) % len(keys)
+		key := keys[idx]
 		queue := band.Queue(key.ID)
 		if queue == nil || queue.Len() == 0 {
 			continue
 		}
 
-		// Refill deficit if depleted (flow has used up its credits)
-		deficit := state.deficits[key.ID]
-		if deficit <= 0 {
-			quantum := p.calculateQuantum(queue)
-			deficit = min(quantum+deficit, p.config.MaxDeficit)
-			state.deficits[key.ID] = deficit
-		}
+		// Refill deficit with quantum for this flow
+		quantum := p.calculateQuantum(queue)
+		state.deficits[key.ID] = quantum
 
-		// Track the flow with the highest deficit
-		if deficit > maxDeficit {
-			maxDeficit = deficit
-			maxKey = key
-			found = true
-		}
+		// Select this flow and deduct one unit
+		state.deficits[key.ID]--
+		state.lastSelected = &key
+		return queue, nil
 	}
 
-	if found {
-		maxQueue := band.Queue(maxKey.ID)
-		state.deficits[maxKey.ID]--
-		state.lastSelected = &maxKey
-		return maxQueue, nil
-	}
-
-	// No queue selected (all queues either empty or insufficient deficit)
+	// No queue selected (all queues empty)
 	// Clean up deficits for flows no longer in the band
 	p.cleanupDeficits(state, keys)
 

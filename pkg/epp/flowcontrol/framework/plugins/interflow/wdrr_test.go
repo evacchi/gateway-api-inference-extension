@@ -19,9 +19,11 @@ package interflow
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -334,7 +336,9 @@ func TestWDRR_SelectQueue_AntiStarvation(t *testing.T) {
 	mockBand.PolicyStateV = policy.NewState(ctx)
 	selectionCounts := make(map[string]int)
 	lowPriorityFirstSelection := -1
-	numSelections := 100
+	// Need enough iterations for at least one complete round through both flows
+	// High priority quantum=100, low priority quantum=10, total=110 for one round
+	numSelections := 160
 
 	for i := range numSelections {
 		selected, err := policy.Pick(ctx, mockBand)
@@ -353,16 +357,17 @@ func TestWDRR_SelectQueue_AntiStarvation(t *testing.T) {
 	assert.Greater(t, selectionCounts["lowPriority"], 0,
 		"Low-priority flow must receive service (anti-starvation guarantee)")
 
-	// Verify low priority got serviced within reasonable time
+	// Verify low priority got serviced within bounded time
 	// With weight ratio 10:1, high priority gets quantum=100, low priority gets quantum=10
-	// Low priority should get service once high priority's deficit is depleted (around iteration 100)
-	assert.Less(t, lowPriorityFirstSelection, numSelections,
-		"Low-priority flow should be serviced within the test period (first selection at iteration %d)", lowPriorityFirstSelection)
+	// Low priority should get service after high priority's quantum is depleted (at iteration 100)
+	assert.Equal(t, 100, lowPriorityFirstSelection,
+		"Low-priority flow should be serviced after high-priority quantum depleted (at iteration 100)")
 
-	// High priority should get significantly more selections due to 10:1 weight ratio
-	// Expected ratio is approximately 10:1
-	assert.Greater(t, selectionCounts["highPriority"], selectionCounts["lowPriority"]*5,
-		"High-priority flow should get significantly more selections (ratio should be >> 5:1)")
+	// Verify weighted fairness: ratio should approximate 10:1
+	// In 160 selections: first round = 100 high + 10 low, second round partial = 50 high
+	// Expected: high=150, low=10 (ratio 15:1 due to partial second round)
+	assert.Equal(t, 150, selectionCounts["highPriority"], "High-priority count")
+	assert.Equal(t, 10, selectionCounts["lowPriority"], "Low-priority count")
 
 	t.Logf("Anti-starvation test: highPriority=%d, lowPriority=%d (first at iteration %d)",
 		selectionCounts["highPriority"], selectionCounts["lowPriority"], lowPriorityFirstSelection)
@@ -432,20 +437,22 @@ func TestWDRR_SelectQueue_DynamicFlows(t *testing.T) {
 	mockBand := newTestBand(queue1, queue2)
 
 	// Make some selections
-	mockBand.PolicyStateV = policy.NewState(ctx)
+	state := policy.NewState(ctx)
+	mockBand.PolicyStateV = state
 	for i := range 5 {
 		_, err := policy.Pick(ctx, mockBand)
 		require.NoError(t, err, "SelectQueue should not error on initial iteration %d", i)
 	}
 
-	// Add a third flow
+	// Add a third flow - IMPORTANT: reuse the same state to preserve deficit counters
 	queue3 := &frameworkmocks.MockFlowQueueAccessor{LenV: 5, FlowKeyV: flow3Key}
 	mockBand = newTestBand(queue1, queue2, queue3)
-	mockBand.PolicyStateV = policy.NewState(ctx)
+	mockBand.PolicyStateV = state // Reuse existing state
 
 	// Continue selections - should handle new flow gracefully
+	// Need at least 30 selections to ensure all 3 flows get service (3 × quantum=10)
 	selectionCounts := make(map[string]int)
-	for i := range 15 {
+	for i := range 30 {
 		selected, err := policy.Pick(ctx, mockBand)
 		require.NoError(t, err, "SelectQueue should not error on iteration %d", i)
 		if selected != nil {
@@ -564,4 +571,135 @@ func TestWDRR_SelectQueue_SkipsEmptyQueueWithPositiveDeficit(t *testing.T) {
 		require.NotNil(t, selected, "Pick should select a queue on iteration %d", i)
 		assert.Equal(t, "flow2", selected.FlowKey().ID, "Only flow2 should be selected when flow1 is empty on iteration %d", i)
 	}
+}
+
+// TestWDRR_LoadTest performs a high-volume concurrent load test to verify:
+// 1. Thread safety under heavy concurrent access
+// 2. Fairness (weighted ratio correctness at scale)
+// 3. Anti-starvation (low priority flows get service)
+// 4. Performance (throughput metrics)
+//
+// Run with: go test -v -run TestWDRR_LoadTest
+// Skip with: go test -short (default)
+func TestWDRR_LoadTest(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping load test in short mode")
+	}
+
+	ctx := context.Background()
+
+	// Configure three flows with 10:5:1 weight ratio
+	config := DefaultWDRRConfig()
+	config.FlowWeights = map[string]int{
+		"high":   10,
+		"medium": 5,
+		"low":    1,
+	}
+	policy := NewWDRR("", config)
+
+	// Create flows
+	highFlow := types.FlowKey{ID: "high", Priority: 0}
+	mediumFlow := types.FlowKey{ID: "medium", Priority: 0}
+	lowFlow := types.FlowKey{ID: "low", Priority: 0}
+
+	// Simulate queues with constant high load
+	queueHigh := &frameworkmocks.MockFlowQueueAccessor{LenV: 1000, FlowKeyV: highFlow}
+	queueMedium := &frameworkmocks.MockFlowQueueAccessor{LenV: 1000, FlowKeyV: mediumFlow}
+	queueLow := &frameworkmocks.MockFlowQueueAccessor{LenV: 1000, FlowKeyV: lowFlow}
+
+	mockBand := newTestBand(queueHigh, queueMedium, queueLow)
+	mockBand.PolicyStateV = policy.NewState(ctx)
+
+	// Load test parameters
+	numWorkers := 100              // Concurrent goroutines
+	selectionsPerWorker := 10000   // Selections per goroutine
+	totalSelections := int64(numWorkers * selectionsPerWorker)
+
+	t.Logf("Starting load test: %d workers × %d selections = %d total selections",
+		numWorkers, selectionsPerWorker, totalSelections)
+
+	// Track results
+	var selectionCounts sync.Map
+	var wg sync.WaitGroup
+	start := time.Now()
+
+	// Launch workers
+	wg.Add(numWorkers)
+	for range numWorkers {
+		go func() {
+			defer wg.Done()
+			for range selectionsPerWorker {
+				selected, err := policy.Pick(ctx, mockBand)
+				if err == nil && selected != nil {
+					val, _ := selectionCounts.LoadOrStore(selected.FlowKey().ID, new(atomic.Int64))
+					val.(*atomic.Int64).Add(1)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	// Collect results
+	highCount := loadCount(&selectionCounts, "high")
+	mediumCount := loadCount(&selectionCounts, "medium")
+	lowCount := loadCount(&selectionCounts, "low")
+	actualTotal := highCount + mediumCount + lowCount
+
+	// Verify all selections succeeded
+	require.Equal(t, totalSelections, actualTotal, "All selections should succeed")
+
+	// Expected distribution with 10:5:1 weight ratio (total weight = 16)
+	// high: 10/16 = 62.5%, medium: 5/16 = 31.25%, low: 1/16 = 6.25%
+	totalWeight := 10 + 5 + 1
+	expectedHigh := float64(totalSelections) * 10.0 / float64(totalWeight)
+	expectedMedium := float64(totalSelections) * 5.0 / float64(totalWeight)
+	expectedLow := float64(totalSelections) * 1.0 / float64(totalWeight)
+
+	// Verify fairness with 5% tolerance
+	// At 1M selections, we expect very tight distribution
+	assertWithinPercent(t, highCount, expectedHigh, 5.0, "high flow")
+	assertWithinPercent(t, mediumCount, expectedMedium, 5.0, "medium flow")
+	assertWithinPercent(t, lowCount, expectedLow, 5.0, "low flow")
+
+	// Anti-starvation: low priority MUST get service despite being 1/16 of total weight
+	assert.Greater(t, lowCount, int64(0), "Low priority flow must not starve")
+
+	// Performance metrics
+	selectionsPerSec := float64(totalSelections) / elapsed.Seconds()
+
+	t.Logf("Load test completed in %v", elapsed)
+	t.Logf("Throughput: %.0f selections/sec", selectionsPerSec)
+	t.Logf("Distribution:")
+	t.Logf("  high   (weight=10): %8d selections (%.2f%%, expected %.2f%%)",
+		highCount, 100.0*float64(highCount)/float64(totalSelections), 100.0*10.0/float64(totalWeight))
+	t.Logf("  medium (weight=5):  %8d selections (%.2f%%, expected %.2f%%)",
+		mediumCount, 100.0*float64(mediumCount)/float64(totalSelections), 100.0*5.0/float64(totalWeight))
+	t.Logf("  low    (weight=1):  %8d selections (%.2f%%, expected %.2f%%)",
+		lowCount, 100.0*float64(lowCount)/float64(totalSelections), 100.0*1.0/float64(totalWeight))
+
+	// Sanity check: throughput should be reasonable
+	// Even on slow systems, we should process >100k selections/sec
+	assert.Greater(t, selectionsPerSec, 100000.0,
+		"Throughput seems unusually low - possible performance regression")
+}
+
+// loadCount retrieves the count for a given flow ID from the sync.Map
+func loadCount(m *sync.Map, key string) int64 {
+	if val, ok := m.Load(key); ok {
+		return val.(*atomic.Int64).Load()
+	}
+	return 0
+}
+
+// assertWithinPercent verifies that actual is within percentage tolerance of expected
+func assertWithinPercent(t *testing.T, actual int64, expected float64, tolerancePct float64, label string) {
+	t.Helper()
+	actualF := float64(actual)
+	diffPct := 100.0 * math.Abs(actualF-expected) / expected
+
+	assert.LessOrEqual(t, diffPct, tolerancePct,
+		"%s: actual=%d, expected=%.0f, diff=%.2f%% > tolerance=%.0f%%",
+		label, actual, expected, diffPct, tolerancePct)
 }
