@@ -17,20 +17,22 @@ limitations under the License.
 package interflow
 
 import (
+	"encoding/json"
 	"math"
 	"slices"
 	"sync"
 
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/flowcontrol/framework"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/flowcontrol/types"
+	fwkplugin "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/plugin"
 )
 
 // WDRRPolicyName is the name of the Weighted Deficit Round Robin policy implementation.
 const WDRRPolicyName = "WDRR"
 
 func init() {
-	MustRegisterPolicy(RegisteredPolicyName(WDRRPolicyName),
-		func() (framework.InterFlowDispatchPolicy, error) {
+	fwkplugin.Register(WDRRPolicyName,
+		func(name string, _ json.RawMessage, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
 			return NewWDRR(DefaultWDRRConfig()), nil
 		})
 }
@@ -49,10 +51,10 @@ func init() {
 //
 // Thread-safety: All state mutations are protected by a single mutex.
 type weightedDeficitRoundRobin struct {
-	mu           sync.Mutex         // Protects all fields below
-	deficits     map[string]int64   // FlowID -> accumulated deficit counter
-	lastSelected *types.FlowKey     // Last selected flow for round-robin iteration
-	config       *WDRRConfig        // Immutable configuration (can be read without lock after construction)
+	mu           sync.Mutex       // Protects all fields below
+	deficits     map[string]int64 // FlowID -> accumulated deficit counter
+	lastSelected *types.FlowKey   // Last selected flow for round-robin iteration
+	config       *WDRRConfig      // Immutable configuration (can be read without lock after construction)
 }
 
 // NewWDRR creates a new WDRR policy with the given configuration.
@@ -61,7 +63,7 @@ type weightedDeficitRoundRobin struct {
 // (following the pattern of init-time registration where errors must be surfaced immediately).
 //
 // Note: The config is treated as immutable after construction for thread-safety.
-func NewWDRR(config *WDRRConfig) framework.InterFlowDispatchPolicy {
+func NewWDRR(config *WDRRConfig) framework.FairnessPolicy {
 	if config == nil {
 		config = DefaultWDRRConfig()
 	}
@@ -174,18 +176,19 @@ func (p *weightedDeficitRoundRobin) SelectQueue(band framework.PriorityBandAcces
 // calculateQuantum computes the quantum for a given queue based on its weight and current load.
 //
 // Formula:
-//   weight = FlowWeights[flowID] or DefaultWeight if not specified
-//   baseQuantum = BaseQuantum * weight
-//   currentLoad = queue.Len() or queue.ByteSize() (depending on UseByteSize)
 //
-//   if currentLoad > LoadThreshold:
-//     loadFactor = currentLoad / LoadThreshold
-//     boost = (loadFactor - 1.0) * LoadBoostFactor
-//     adjustedQuantum = baseQuantum * (1.0 + boost)
-//   else:
-//     adjustedQuantum = baseQuantum
+//	weight = FlowWeights[flowID] or DefaultWeight if not specified
+//	baseQuantum = BaseQuantum * weight
+//	currentLoad = queue.Len() or queue.ByteSize() (depending on UseByteSize)
 //
-//   return max(adjustedQuantum, MinQuantum)
+//	if currentLoad > LoadThreshold:
+//	  loadFactor = currentLoad / LoadThreshold
+//	  boost = (loadFactor - 1.0) * LoadBoostFactor
+//	  adjustedQuantum = baseQuantum * (1.0 + boost)
+//	else:
+//	  adjustedQuantum = baseQuantum
+//
+//	return max(adjustedQuantum, MinQuantum)
 //
 // This ensures:
 //  1. Higher-weight flows get more quantum (weighted fairness)

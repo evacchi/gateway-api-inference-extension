@@ -22,18 +22,21 @@ limitations under the License.
 package interflow
 
 import (
+	"context"
+	"encoding/json"
 	"math/rand/v2"
 
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/flowcontrol/framework"
+	fwkplugin "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/plugin"
 )
 
 // RandomSelectPolicyName is the name of the RandomSelect policy implementation.
 const RandomSelectPolicyName = "RandomSelect"
 
 func init() {
-	MustRegisterPolicy(RegisteredPolicyName(RandomSelectPolicyName),
-		func() (framework.InterFlowDispatchPolicy, error) {
-			return newRandomSelect(), nil
+	fwkplugin.Register(RandomSelectPolicyName,
+		func(name string, _ json.RawMessage, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
+			return newRandomSelect(name), nil
 		})
 }
 
@@ -46,18 +49,31 @@ func init() {
 //
 // Purpose: This policy serves as a learning example for understanding how to implement the InterFlowDispatchPolicy
 // interface. It is NOT recommended for production use as it provides no fairness guarantees.
-type randomSelect struct{}
-
-func newRandomSelect() framework.InterFlowDispatchPolicy {
-	return &randomSelect{}
+type randomSelect struct {
+	name string
 }
 
-// Name returns the name of the policy.
-func (p *randomSelect) Name() string {
-	return RandomSelectPolicyName
+func (p *randomSelect) NewState(ctx context.Context) any {
+	//TODO implement me
+	panic("implement me")
 }
 
-// SelectQueue randomly selects a non-empty queue from the given priority band.
+func newRandomSelect(name string) framework.FairnessPolicy {
+	if name == "" {
+		name = RoundRobinFairnessPolicyType
+	}
+	return &randomSelect{name: name}
+}
+
+// TypedName returns the type and name tuple of this plugin instance.
+func (p *randomSelect) TypedName() fwkplugin.TypedName {
+	return fwkplugin.TypedName{
+		Type: RandomSelectPolicyName,
+		Name: p.name,
+	}
+}
+
+// Pick randomly selects a non-empty queue from the given priority band.
 //
 // Algorithm:
 //  1. Iterate through all queues in the band
@@ -74,16 +90,19 @@ func (p *randomSelect) Name() string {
 // Returns:
 //   - FlowQueueAccessor: A randomly selected non-empty queue, or nil if all queues are empty or band is nil
 //   - error: Always nil for this simple policy (errors are reserved for unrecoverable conditions)
-func (p *randomSelect) SelectQueue(band framework.PriorityBandAccessor) (framework.FlowQueueAccessor, error) {
+func (p *randomSelect) Pick(
+	_ context.Context,
+	flowGroup framework.PriorityBandAccessor,
+) (framework.FlowQueueAccessor, error) {
 	// Handle nil band - return nil queue with no error
-	if band == nil {
+	if flowGroup == nil {
 		return nil, nil
 	}
 
 	// Collect all non-empty queues
 	var nonEmptyQueues []framework.FlowQueueAccessor
 
-	band.IterateQueues(func(queue framework.FlowQueueAccessor) (keepIterating bool) {
+	flowGroup.IterateQueues(func(queue framework.FlowQueueAccessor) (keepIterating bool) {
 		// Skip nil queues and empty queues
 		if queue != nil && queue.Len() > 0 {
 			nonEmptyQueues = append(nonEmptyQueues, queue)
