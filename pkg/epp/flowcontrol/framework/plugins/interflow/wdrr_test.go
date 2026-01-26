@@ -650,3 +650,49 @@ func TestWDRR_SelectQueue_ByteSizeMode(t *testing.T) {
 	t.Logf("ByteSize mode distribution: largeBytes=%d (3KB), smallBytes=%d (500B)",
 		selectionCounts["largeBytes"], selectionCounts["smallBytes"])
 }
+
+func TestWDRR_SelectQueue_SkipsEmptyQueueWithPositiveDeficit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	// Configure flow1 with higher weight to build up deficit faster
+	config := DefaultWDRRConfig()
+	config.FlowWeights = map[string]int{
+		"flow1": 10,
+		"flow2": 1,
+	}
+	policy := NewWDRR("", config)
+
+	flow1Key := types.FlowKey{ID: "flow1", Priority: 0}
+	flow2Key := types.FlowKey{ID: "flow2", Priority: 0}
+
+	// Start with both queues having items
+	queue1 := &frameworkmocks.MockFlowQueueAccessor{LenV: 5, FlowKeyV: flow1Key}
+	queue2 := &frameworkmocks.MockFlowQueueAccessor{LenV: 100, FlowKeyV: flow2Key}
+
+	mockBand := newTestBand(queue1, queue2)
+	mockBand.PolicyStateV = policy.NewState(ctx)
+
+	// Make a selection - flow1 should be selected and build up deficit
+	selected, err := policy.Pick(ctx, mockBand)
+	require.NoError(t, err, "First Pick should not error")
+	require.NotNil(t, selected, "First Pick should select a queue")
+	assert.Equal(t, "flow1", selected.FlowKey().ID, "flow1 should be selected first (higher weight)")
+
+	// Now empty flow1's queue (simulating external consumption)
+	queue1.LenV = 0
+
+	// Make another selection - flow2 should be selected, NOT flow1 despite flow1 having positive deficit
+	selected, err = policy.Pick(ctx, mockBand)
+	require.NoError(t, err, "Second Pick should not error")
+	require.NotNil(t, selected, "Second Pick should select a queue")
+	assert.Equal(t, "flow2", selected.FlowKey().ID, "flow2 should be selected when flow1 is empty, even though flow1 has positive deficit")
+
+	// Continue selecting - should keep selecting flow2
+	for i := 0; i < 10; i++ {
+		selected, err = policy.Pick(ctx, mockBand)
+		require.NoError(t, err, "Pick should not error on iteration %d", i)
+		require.NotNil(t, selected, "Pick should select a queue on iteration %d", i)
+		assert.Equal(t, "flow2", selected.FlowKey().ID, "Only flow2 should be selected when flow1 is empty on iteration %d", i)
+	}
+}

@@ -53,8 +53,10 @@ func init() {
 //
 // Thread-safety: All state mutations are protected by a single mutex.
 type weightedDeficitRoundRobin struct {
-	name   string      // Plugin instance name
-	config *WDRRConfig // Immutable configuration (can be read without lock after construction)
+	name        string      // Plugin instance name
+	config      *WDRRConfig // Immutable configuration (can be read without lock after construction)
+	currentLoad func(queue framework.FlowQueueAccessor) int
+	applyBoost  func(currentLoad int, baseQuantum int64) int64
 }
 
 // wdrrState holds the mutable state for a specific priority band.
@@ -81,10 +83,35 @@ func NewWDRR(name string, config *WDRRConfig) framework.FairnessPolicy {
 	if err := config.Validate(); err != nil {
 		panic(err) // Configuration errors are programming errors, fail fast
 	}
+	var calcLoad func(queue framework.FlowQueueAccessor) int
+	if config.UseByteSize {
+		calcLoad = func(queue framework.FlowQueueAccessor) int {
+			return int(queue.ByteSize())
+		}
+	} else {
+		calcLoad = func(queue framework.FlowQueueAccessor) int {
+			return queue.Len()
+		}
+	}
+	var applyBoost func(currentLoad int, baseQuantum int64) int64
+	if config.LoadBoostFactor > 0 {
+		applyBoost = func(currentLoad int, baseQuantum int64) int64 {
+			if currentLoad > config.LoadThreshold {
+				loadFactor := float64(currentLoad) / float64(config.LoadThreshold)
+				boost := (loadFactor - 1.0) * config.LoadBoostFactor
+				return int64(math.Round(float64(baseQuantum) * (1.0 + boost)))
+			}
+			return baseQuantum
+		}
+	} else {
+		applyBoost = func(currentLoad int, baseQuantum int64) int64 { return baseQuantum }
+	}
 
 	return &weightedDeficitRoundRobin{
-		name:   name,
-		config: config,
+		name:        name,
+		config:      config,
+		currentLoad: calcLoad,
+		applyBoost:  applyBoost,
 	}
 }
 
@@ -108,11 +135,11 @@ func (p *weightedDeficitRoundRobin) NewState(_ context.Context) any {
 //
 // Algorithm:
 //  1. Sort flow keys for deterministic iteration order
-//  2. Add quantum to flows with depleted deficit
-//  3. Select flow with highest positive deficit
-//  4. Deduct 1 unit from selected flow's deficit
-//  5. Cap deficits at MaxDeficit to prevent unbounded growth
-//  6. Clean up deficits for flows no longer in the band
+//  2. For each non-empty queue:
+//     a. Refill deficit (add quantum) if deficit is depleted (≤0), capping at MaxDeficit
+//     b. Track the flow with the highest deficit
+//  3. Select the flow with the highest deficit and deduct 1 unit from its deficit
+//  4. If no flow selected, clean up deficits for flows no longer in the band
 //
 // Returns:
 //   - FlowQueueAccessor: The selected queue, or nil if no queue is suitable
@@ -144,55 +171,37 @@ func (p *weightedDeficitRoundRobin) Pick(
 	}
 	slices.SortFunc(keys, func(a, b types.FlowKey) int { return a.Compare(b) })
 
-	// First pass: Add quantum only to flows that have depleted their deficit (need refill)
-	for _, key := range keys {
-		queue := band.Queue(key.ID)
-		if queue != nil && queue.Len() > 0 {
-			// Only add quantum if deficit is non-positive (flow has used up its credits)
-			if state.deficits[key.ID] <= 0 {
-				quantum := p.calculateQuantum(queue)
-				state.deficits[key.ID] += quantum
-
-				// Cap deficit to prevent unbounded growth
-				if state.deficits[key.ID] > p.config.MaxDeficit {
-					state.deficits[key.ID] = p.config.MaxDeficit
-				}
-			}
-		}
-	}
-
-	// Second pass: Select the flow with the highest positive deficit
-	// This ensures flows with higher weights (larger quantums) are selected more often
-	// Break ties using the flow key ordering for determinism
-	var selectedQueue framework.FlowQueueAccessor
-	var selectedKey *types.FlowKey
+	// Iterate through flows to refill depleted deficits and find the flow with highest deficit
 	maxDeficit := int64(0)
-
+	found := false
+	maxKey := types.FlowKey{}
 	for _, key := range keys {
 		queue := band.Queue(key.ID)
-
-		// Skip nil or empty queues
 		if queue == nil || queue.Len() == 0 {
 			continue
 		}
 
-		flowID := key.ID
-		currentDeficit := state.deficits[flowID]
+		// Refill deficit if depleted (flow has used up its credits)
+		deficit := state.deficits[key.ID]
+		if deficit <= 0 {
+			quantum := p.calculateQuantum(queue)
+			deficit = min(quantum+deficit, p.config.MaxDeficit)
+			state.deficits[key.ID] = deficit
+		}
 
-		// Select the flow with the highest positive deficit
-		if currentDeficit > maxDeficit {
-			maxDeficit = currentDeficit
-			selectedQueue = queue
-			selectedKeyCopy := key // Copy to avoid pointer issues
-			selectedKey = &selectedKeyCopy
+		// Track the flow with the highest deficit
+		if deficit > maxDeficit {
+			maxDeficit = deficit
+			maxKey = key
+			found = true
 		}
 	}
 
-	// If we found a flow with positive deficit, select it and deduct 1 unit
-	if selectedQueue != nil && selectedKey != nil {
-		state.deficits[selectedKey.ID]--
-		state.lastSelected = selectedKey
-		return selectedQueue, nil
+	if found {
+		maxQueue := band.Queue(maxKey.ID)
+		state.deficits[maxKey.ID]--
+		state.lastSelected = &maxKey
+		return maxQueue, nil
 	}
 
 	// No queue selected (all queues either empty or insufficient deficit)
@@ -226,27 +235,12 @@ func (p *weightedDeficitRoundRobin) Pick(
 func (p *weightedDeficitRoundRobin) calculateQuantum(queue framework.FlowQueueAccessor) int64 {
 	flowID := queue.FlowKey().ID
 
-	// Get weight for this flow
-	weight := p.getWeight(flowID)
-
-	// Calculate base quantum
+	weight := p.weight(flowID)
 	baseQuantum := p.config.BaseQuantum * int64(weight)
-
-	// Get current load
-	var currentLoad int
-	if p.config.UseByteSize {
-		currentLoad = int(queue.ByteSize())
-	} else {
-		currentLoad = queue.Len()
-	}
+	currentLoad := p.currentLoad(queue)
 
 	// Apply load-based boost if above threshold
-	adjustedQuantum := baseQuantum
-	if currentLoad > p.config.LoadThreshold && p.config.LoadBoostFactor > 0 {
-		loadFactor := float64(currentLoad) / float64(p.config.LoadThreshold)
-		boost := (loadFactor - 1.0) * p.config.LoadBoostFactor
-		adjustedQuantum = int64(math.Round(float64(baseQuantum) * (1.0 + boost)))
-	}
+	adjustedQuantum := p.applyBoost(currentLoad, baseQuantum)
 
 	// Ensure minimum quantum (anti-starvation guarantee)
 	if adjustedQuantum < p.config.MinQuantum {
@@ -256,9 +250,9 @@ func (p *weightedDeficitRoundRobin) calculateQuantum(queue framework.FlowQueueAc
 	return adjustedQuantum
 }
 
-// getWeight returns the weight for a given flow ID.
+// weight returns the weight for a given flow ID.
 // Returns the configured weight if present in FlowWeights, otherwise returns DefaultWeight.
-func (p *weightedDeficitRoundRobin) getWeight(flowID string) int {
+func (p *weightedDeficitRoundRobin) weight(flowID string) int {
 	if weight, ok := p.config.FlowWeights[flowID]; ok {
 		return weight
 	}

@@ -38,17 +38,17 @@ func TestRandomSelect_Name(t *testing.T) {
 	assert.Equal(t, RandomSelectPolicyName, typedName.Name, "Name should match the policy's constant")
 }
 
-func TestRandomSelect_SelectQueue_NilBand(t *testing.T) {
+func TestRandomSelect_Pick_NilBand(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	policy := newRandomSelect("")
 
 	selected, err := policy.Pick(ctx, nil)
-	require.NoError(t, err, "SelectQueue should not error on nil band")
-	assert.Nil(t, selected, "SelectQueue should return nil when band is nil")
+	require.NoError(t, err, "Pick should not error on nil band")
+	assert.Nil(t, selected, "Pick should return nil when band is nil")
 }
 
-func TestRandomSelect_SelectQueue_EmptyBand(t *testing.T) {
+func TestRandomSelect_Pick_EmptyBand(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	policy := newRandomSelect("")
@@ -56,11 +56,11 @@ func TestRandomSelect_SelectQueue_EmptyBand(t *testing.T) {
 	mockBand := newTestBand() // Empty band with no queues
 
 	selected, err := policy.Pick(ctx, mockBand)
-	require.NoError(t, err, "SelectQueue should not error on empty band")
-	assert.Nil(t, selected, "SelectQueue should return nil when band is empty")
+	require.NoError(t, err, "Pick should not error on empty band")
+	assert.Nil(t, selected, "Pick should return nil when band is empty")
 }
 
-func TestRandomSelect_SelectQueue_AllEmptyQueues(t *testing.T) {
+func TestRandomSelect_Pick_AllEmptyQueues(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	policy := newRandomSelect("")
@@ -77,11 +77,11 @@ func TestRandomSelect_SelectQueue_AllEmptyQueues(t *testing.T) {
 	mockBand := newTestBand(queue1, queue2, queue3)
 
 	selected, err := policy.Pick(ctx, mockBand)
-	require.NoError(t, err, "SelectQueue should not error when all queues are empty")
-	assert.Nil(t, selected, "SelectQueue should return nil when all queues are empty")
+	require.NoError(t, err, "Pick should not error when all queues are empty")
+	assert.Nil(t, selected, "Pick should return nil when all queues are empty")
 }
 
-func TestRandomSelect_SelectQueue_SingleNonEmptyQueue(t *testing.T) {
+func TestRandomSelect_Pick_SingleNonEmptyQueue(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	policy := newRandomSelect("")
@@ -93,12 +93,12 @@ func TestRandomSelect_SelectQueue_SingleNonEmptyQueue(t *testing.T) {
 	mockBand := newTestBand(queue)
 
 	selected, err := policy.Pick(ctx, mockBand)
-	require.NoError(t, err, "SelectQueue should not error with a single non-empty queue")
-	require.NotNil(t, selected, "SelectQueue should select the only non-empty queue")
+	require.NoError(t, err, "Pick should not error with a single non-empty queue")
+	require.NotNil(t, selected, "Pick should select the only non-empty queue")
 	assert.Equal(t, "flow1", selected.FlowKey().ID, "Should select flow1")
 }
 
-func TestRandomSelect_SelectQueue_MultipleNonEmptyQueues(t *testing.T) {
+func TestRandomSelect_Pick_MultipleNonEmptyQueues(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	policy := newRandomSelect("")
@@ -117,8 +117,8 @@ func TestRandomSelect_SelectQueue_MultipleNonEmptyQueues(t *testing.T) {
 	// Perform multiple selections to verify a queue is always selected
 	for i := range 10 {
 		selected, err := policy.Pick(ctx, mockBand)
-		require.NoError(t, err, "SelectQueue should not error on iteration %d", i)
-		require.NotNil(t, selected, "SelectQueue should select a queue on iteration %d", i)
+		require.NoError(t, err, "Pick should not error on iteration %d", i)
+		require.NotNil(t, selected, "Pick should select a queue on iteration %d", i)
 
 		// Verify the selected queue is one of the three non-empty queues
 		selectedID := selected.FlowKey().ID
@@ -127,7 +127,7 @@ func TestRandomSelect_SelectQueue_MultipleNonEmptyQueues(t *testing.T) {
 	}
 }
 
-func TestRandomSelect_SelectQueue_SkipsEmptyQueues(t *testing.T) {
+func TestRandomSelect_Pick_SkipsEmptyQueues(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	policy := newRandomSelect("")
@@ -148,8 +148,8 @@ func TestRandomSelect_SelectQueue_SkipsEmptyQueues(t *testing.T) {
 	// Perform multiple selections to verify only non-empty queues are selected
 	for i := range 20 {
 		selected, err := policy.Pick(ctx, mockBand)
-		require.NoError(t, err, "SelectQueue should not error on iteration %d", i)
-		require.NotNil(t, selected, "SelectQueue should select a queue on iteration %d", i)
+		require.NoError(t, err, "Pick should not error on iteration %d", i)
+		require.NotNil(t, selected, "Pick should select a queue on iteration %d", i)
 
 		selectedID := selected.FlowKey().ID
 		assert.Contains(t, []string{"flow1", "flow2"}, selectedID,
@@ -159,7 +159,7 @@ func TestRandomSelect_SelectQueue_SkipsEmptyQueues(t *testing.T) {
 	}
 }
 
-func TestRandomSelect_SelectQueue_RandomDistribution(t *testing.T) {
+func TestRandomSelect_Pick_RandomDistribution(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	policy := newRandomSelect("")
@@ -181,8 +181,8 @@ func TestRandomSelect_SelectQueue_RandomDistribution(t *testing.T) {
 
 	for range numSelections {
 		selected, err := policy.Pick(ctx, mockBand)
-		require.NoError(t, err, "SelectQueue should not error")
-		require.NotNil(t, selected, "SelectQueue should select a queue")
+		require.NoError(t, err, "Pick should not error")
+		require.NotNil(t, selected, "Pick should select a queue")
 
 		selectionCounts[selected.FlowKey().ID]++
 	}
@@ -196,7 +196,7 @@ func TestRandomSelect_SelectQueue_RandomDistribution(t *testing.T) {
 	// We use a generous tolerance since random selection can have variance
 	expectedCount := numSelections / 3
 	minExpectedCount := expectedCount / 3 // At least 1/9 of total selections
-	maxExpectedCount := expectedCount * 2  // At most 2/3 of total selections
+	maxExpectedCount := expectedCount * 2 // At most 2/3 of total selections
 
 	for flowID, count := range selectionCounts {
 		assert.GreaterOrEqual(t, count, minExpectedCount,
@@ -209,7 +209,7 @@ func TestRandomSelect_SelectQueue_RandomDistribution(t *testing.T) {
 		numSelections, selectionCounts["flow1"], selectionCounts["flow2"], selectionCounts["flow3"])
 }
 
-func TestRandomSelect_SelectQueue_Concurrency(t *testing.T) {
+func TestRandomSelect_Pick_Concurrency(t *testing.T) {
 	t.Parallel()
 	// Run this test multiple times to increase the chance of catching race conditions
 	for i := range 5 {
