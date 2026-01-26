@@ -53,14 +53,15 @@ type randomSelect struct {
 	name string
 }
 
-func (p *randomSelect) NewState(ctx context.Context) any {
-	//TODO implement me
-	panic("implement me")
+// NewState initializes the policy state for a specific priority band.
+// RandomSelect is stateless, so it returns nil.
+func (p *randomSelect) NewState(_ context.Context) any {
+	return nil // Stateless policy - no state needed
 }
 
 func newRandomSelect(name string) framework.FairnessPolicy {
 	if name == "" {
-		name = RoundRobinFairnessPolicyType
+		name = RandomSelectPolicyName
 	}
 	return &randomSelect{name: name}
 }

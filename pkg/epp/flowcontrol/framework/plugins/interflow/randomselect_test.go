@@ -17,6 +17,7 @@ limitations under the License.
 package interflow
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -31,33 +32,38 @@ import (
 
 func TestRandomSelect_Name(t *testing.T) {
 	t.Parallel()
-	policy := newRandomSelect()
-	assert.Equal(t, RandomSelectPolicyName, policy.Name(), "Name should match the policy's constant")
+	policy := newRandomSelect("")
+	typedName := policy.TypedName()
+	assert.Equal(t, RandomSelectPolicyName, typedName.Type, "Type should match the policy's constant")
+	assert.Equal(t, RandomSelectPolicyName, typedName.Name, "Name should match the policy's constant")
 }
 
 func TestRandomSelect_SelectQueue_NilBand(t *testing.T) {
 	t.Parallel()
-	policy := newRandomSelect()
+	ctx := context.Background()
+	policy := newRandomSelect("")
 
-	selected, err := policy.SelectQueue(nil)
+	selected, err := policy.Pick(ctx, nil)
 	require.NoError(t, err, "SelectQueue should not error on nil band")
 	assert.Nil(t, selected, "SelectQueue should return nil when band is nil")
 }
 
 func TestRandomSelect_SelectQueue_EmptyBand(t *testing.T) {
 	t.Parallel()
-	policy := newRandomSelect()
+	ctx := context.Background()
+	policy := newRandomSelect("")
 
 	mockBand := newTestBand() // Empty band with no queues
 
-	selected, err := policy.SelectQueue(mockBand)
+	selected, err := policy.Pick(ctx, mockBand)
 	require.NoError(t, err, "SelectQueue should not error on empty band")
 	assert.Nil(t, selected, "SelectQueue should return nil when band is empty")
 }
 
 func TestRandomSelect_SelectQueue_AllEmptyQueues(t *testing.T) {
 	t.Parallel()
-	policy := newRandomSelect()
+	ctx := context.Background()
+	policy := newRandomSelect("")
 
 	// Setup: Three flows but all with empty queues
 	emptyFlow1Key := types.FlowKey{ID: "empty1", Priority: 0}
@@ -70,14 +76,15 @@ func TestRandomSelect_SelectQueue_AllEmptyQueues(t *testing.T) {
 
 	mockBand := newTestBand(queue1, queue2, queue3)
 
-	selected, err := policy.SelectQueue(mockBand)
+	selected, err := policy.Pick(ctx, mockBand)
 	require.NoError(t, err, "SelectQueue should not error when all queues are empty")
 	assert.Nil(t, selected, "SelectQueue should return nil when all queues are empty")
 }
 
 func TestRandomSelect_SelectQueue_SingleNonEmptyQueue(t *testing.T) {
 	t.Parallel()
-	policy := newRandomSelect()
+	ctx := context.Background()
+	policy := newRandomSelect("")
 
 	// Setup: Only one non-empty queue
 	flowKey := types.FlowKey{ID: "flow1", Priority: 0}
@@ -85,7 +92,7 @@ func TestRandomSelect_SelectQueue_SingleNonEmptyQueue(t *testing.T) {
 
 	mockBand := newTestBand(queue)
 
-	selected, err := policy.SelectQueue(mockBand)
+	selected, err := policy.Pick(ctx, mockBand)
 	require.NoError(t, err, "SelectQueue should not error with a single non-empty queue")
 	require.NotNil(t, selected, "SelectQueue should select the only non-empty queue")
 	assert.Equal(t, "flow1", selected.FlowKey().ID, "Should select flow1")
@@ -93,7 +100,8 @@ func TestRandomSelect_SelectQueue_SingleNonEmptyQueue(t *testing.T) {
 
 func TestRandomSelect_SelectQueue_MultipleNonEmptyQueues(t *testing.T) {
 	t.Parallel()
-	policy := newRandomSelect()
+	ctx := context.Background()
+	policy := newRandomSelect("")
 
 	// Setup: Three non-empty queues
 	flow1Key := types.FlowKey{ID: "flow1", Priority: 0}
@@ -108,7 +116,7 @@ func TestRandomSelect_SelectQueue_MultipleNonEmptyQueues(t *testing.T) {
 
 	// Perform multiple selections to verify a queue is always selected
 	for i := range 10 {
-		selected, err := policy.SelectQueue(mockBand)
+		selected, err := policy.Pick(ctx, mockBand)
 		require.NoError(t, err, "SelectQueue should not error on iteration %d", i)
 		require.NotNil(t, selected, "SelectQueue should select a queue on iteration %d", i)
 
@@ -121,7 +129,8 @@ func TestRandomSelect_SelectQueue_MultipleNonEmptyQueues(t *testing.T) {
 
 func TestRandomSelect_SelectQueue_SkipsEmptyQueues(t *testing.T) {
 	t.Parallel()
-	policy := newRandomSelect()
+	ctx := context.Background()
+	policy := newRandomSelect("")
 
 	// Setup: Mix of empty and non-empty queues
 	flow1Key := types.FlowKey{ID: "flow1", Priority: 0}
@@ -138,7 +147,7 @@ func TestRandomSelect_SelectQueue_SkipsEmptyQueues(t *testing.T) {
 
 	// Perform multiple selections to verify only non-empty queues are selected
 	for i := range 20 {
-		selected, err := policy.SelectQueue(mockBand)
+		selected, err := policy.Pick(ctx, mockBand)
 		require.NoError(t, err, "SelectQueue should not error on iteration %d", i)
 		require.NotNil(t, selected, "SelectQueue should select a queue on iteration %d", i)
 
@@ -152,7 +161,8 @@ func TestRandomSelect_SelectQueue_SkipsEmptyQueues(t *testing.T) {
 
 func TestRandomSelect_SelectQueue_RandomDistribution(t *testing.T) {
 	t.Parallel()
-	policy := newRandomSelect()
+	ctx := context.Background()
+	policy := newRandomSelect("")
 
 	// Setup: Three non-empty queues with different lengths
 	flow1Key := types.FlowKey{ID: "flow1", Priority: 0}
@@ -170,7 +180,7 @@ func TestRandomSelect_SelectQueue_RandomDistribution(t *testing.T) {
 	selectionCounts := make(map[string]int)
 
 	for range numSelections {
-		selected, err := policy.SelectQueue(mockBand)
+		selected, err := policy.Pick(ctx, mockBand)
 		require.NoError(t, err, "SelectQueue should not error")
 		require.NotNil(t, selected, "SelectQueue should select a queue")
 
@@ -205,7 +215,8 @@ func TestRandomSelect_SelectQueue_Concurrency(t *testing.T) {
 	for i := range 5 {
 		t.Run(fmt.Sprintf("Iteration%d", i), func(t *testing.T) {
 			t.Parallel()
-			policy := newRandomSelect()
+			ctx := context.Background()
+			policy := newRandomSelect("")
 
 			// Setup: Three non-empty queues
 			flow1Key := types.FlowKey{ID: "flow1", Priority: 0}
@@ -230,7 +241,7 @@ func TestRandomSelect_SelectQueue_Concurrency(t *testing.T) {
 				go func() {
 					defer wg.Done()
 					for range selectionsPerGoroutine {
-						selected, err := policy.SelectQueue(mockBand)
+						selected, err := policy.Pick(ctx, mockBand)
 						if err == nil && selected != nil {
 							val, _ := selectionCounts.LoadOrStore(selected.FlowKey().ID, new(atomic.Int64))
 							val.(*atomic.Int64).Add(1)

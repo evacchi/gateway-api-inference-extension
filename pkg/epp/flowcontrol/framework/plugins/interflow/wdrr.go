@@ -17,7 +17,9 @@ limitations under the License.
 package interflow
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"math"
 	"slices"
 	"sync"
@@ -33,11 +35,11 @@ const WDRRPolicyName = "WDRR"
 func init() {
 	fwkplugin.Register(WDRRPolicyName,
 		func(name string, _ json.RawMessage, _ fwkplugin.Handle) (fwkplugin.Plugin, error) {
-			return NewWDRR(DefaultWDRRConfig()), nil
+			return NewWDRR(name, DefaultWDRRConfig()), nil
 		})
 }
 
-// weightedDeficitRoundRobin implements the `framework.InterFlowDispatchPolicy` interface using the
+// weightedDeficitRoundRobin implements the `framework.FairnessPolicy` interface using the
 // Weighted Deficit Round Robin (WDRR) algorithm.
 //
 // WDRR provides anti-starvation guarantees while supporting weighted priorities and load-aware adaptation.
@@ -51,10 +53,16 @@ func init() {
 //
 // Thread-safety: All state mutations are protected by a single mutex.
 type weightedDeficitRoundRobin struct {
+	name   string      // Plugin instance name
+	config *WDRRConfig // Immutable configuration (can be read without lock after construction)
+}
+
+// wdrrState holds the mutable state for a specific priority band.
+// It is initialized via NewState and stored on the PriorityBandAccessor.
+type wdrrState struct {
 	mu           sync.Mutex       // Protects all fields below
 	deficits     map[string]int64 // FlowID -> accumulated deficit counter
 	lastSelected *types.FlowKey   // Last selected flow for round-robin iteration
-	config       *WDRRConfig      // Immutable configuration (can be read without lock after construction)
 }
 
 // NewWDRR creates a new WDRR policy with the given configuration.
@@ -63,7 +71,10 @@ type weightedDeficitRoundRobin struct {
 // (following the pattern of init-time registration where errors must be surfaced immediately).
 //
 // Note: The config is treated as immutable after construction for thread-safety.
-func NewWDRR(config *WDRRConfig) framework.FairnessPolicy {
+func NewWDRR(name string, config *WDRRConfig) framework.FairnessPolicy {
+	if name == "" {
+		name = WDRRPolicyName
+	}
 	if config == nil {
 		config = DefaultWDRRConfig()
 	}
@@ -72,45 +83,63 @@ func NewWDRR(config *WDRRConfig) framework.FairnessPolicy {
 	}
 
 	return &weightedDeficitRoundRobin{
-		deficits: make(map[string]int64),
-		config:   config,
+		name:   name,
+		config: config,
 	}
 }
 
-// Name returns the name of the policy.
-func (p *weightedDeficitRoundRobin) Name() string {
-	return WDRRPolicyName
+// TypedName returns the type and name tuple of this plugin instance.
+func (p *weightedDeficitRoundRobin) TypedName() fwkplugin.TypedName {
+	return fwkplugin.TypedName{
+		Type: WDRRPolicyName,
+		Name: p.name,
+	}
 }
 
-// SelectQueue implements the WDRR selection algorithm.
+// NewState initializes the policy state for a specific priority band.
+func (p *weightedDeficitRoundRobin) NewState(_ context.Context) any {
+	return &wdrrState{
+		deficits: make(map[string]int64),
+	}
+}
+
+// Pick implements the WDRR selection algorithm.
+// It retrieves the band-specific state, locks it, and selects the flow with the highest deficit.
 //
 // Algorithm:
 //  1. Sort flow keys for deterministic iteration order
-//  2. Start iteration after the last selected flow (round-robin)
-//  3. For each flow in order:
-//     a. Skip if queue is empty
-//     b. Calculate quantum based on weight and load
-//     c. Add quantum to flow's deficit counter
-//     d. If deficit >= MinQuantum, select this queue and deduct deficit
-//  4. Cap deficits at MaxDeficit to prevent unbounded growth
-//  5. Clean up deficits for flows no longer in the band
+//  2. Add quantum to flows with depleted deficit
+//  3. Select flow with highest positive deficit
+//  4. Deduct 1 unit from selected flow's deficit
+//  5. Cap deficits at MaxDeficit to prevent unbounded growth
+//  6. Clean up deficits for flows no longer in the band
 //
 // Returns:
 //   - FlowQueueAccessor: The selected queue, or nil if no queue is suitable
-//   - error: Always nil for this policy (errors reserved for unrecoverable conditions)
-func (p *weightedDeficitRoundRobin) SelectQueue(band framework.PriorityBandAccessor) (framework.FlowQueueAccessor, error) {
+//   - error: Error if state type is invalid, nil otherwise
+func (p *weightedDeficitRoundRobin) Pick(
+	_ context.Context,
+	band framework.PriorityBandAccessor,
+) (framework.FlowQueueAccessor, error) {
 	// Handle nil band
 	if band == nil {
 		return nil, nil
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	// Retrieve and validate state
+	v := band.PolicyState()
+	state, ok := v.(*wdrrState)
+	if !ok {
+		return nil, fmt.Errorf("invalid state type for WDRR policy: expected *wdrrState, got %T", v)
+	}
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
 
 	// Get and sort flow keys for deterministic ordering
 	keys := band.FlowKeys()
 	if len(keys) == 0 {
-		p.lastSelected = nil
+		state.lastSelected = nil
 		return nil, nil
 	}
 	slices.SortFunc(keys, func(a, b types.FlowKey) int { return a.Compare(b) })
@@ -120,13 +149,13 @@ func (p *weightedDeficitRoundRobin) SelectQueue(band framework.PriorityBandAcces
 		queue := band.Queue(key.ID)
 		if queue != nil && queue.Len() > 0 {
 			// Only add quantum if deficit is non-positive (flow has used up its credits)
-			if p.deficits[key.ID] <= 0 {
+			if state.deficits[key.ID] <= 0 {
 				quantum := p.calculateQuantum(queue)
-				p.deficits[key.ID] += quantum
+				state.deficits[key.ID] += quantum
 
 				// Cap deficit to prevent unbounded growth
-				if p.deficits[key.ID] > p.config.MaxDeficit {
-					p.deficits[key.ID] = p.config.MaxDeficit
+				if state.deficits[key.ID] > p.config.MaxDeficit {
+					state.deficits[key.ID] = p.config.MaxDeficit
 				}
 			}
 		}
@@ -148,7 +177,7 @@ func (p *weightedDeficitRoundRobin) SelectQueue(band framework.PriorityBandAcces
 		}
 
 		flowID := key.ID
-		currentDeficit := p.deficits[flowID]
+		currentDeficit := state.deficits[flowID]
 
 		// Select the flow with the highest positive deficit
 		if currentDeficit > maxDeficit {
@@ -161,14 +190,14 @@ func (p *weightedDeficitRoundRobin) SelectQueue(band framework.PriorityBandAcces
 
 	// If we found a flow with positive deficit, select it and deduct 1 unit
 	if selectedQueue != nil && selectedKey != nil {
-		p.deficits[selectedKey.ID]--
-		p.lastSelected = selectedKey
+		state.deficits[selectedKey.ID]--
+		state.lastSelected = selectedKey
 		return selectedQueue, nil
 	}
 
 	// No queue selected (all queues either empty or insufficient deficit)
 	// Clean up deficits for flows no longer in the band
-	p.cleanupDeficits(keys)
+	p.cleanupDeficits(state, keys)
 
 	return nil, nil
 }
@@ -239,8 +268,8 @@ func (p *weightedDeficitRoundRobin) getWeight(flowID string) int {
 // cleanupDeficits removes deficit entries for flows that are no longer present in the band.
 // This prevents unbounded memory growth when flows are dynamically added/removed.
 //
-// Must be called with p.mu held.
-func (p *weightedDeficitRoundRobin) cleanupDeficits(activeKeys []types.FlowKey) {
+// Must be called with state.mu held.
+func (p *weightedDeficitRoundRobin) cleanupDeficits(state *wdrrState, activeKeys []types.FlowKey) {
 	// Build set of active flow IDs
 	activeFlows := make(map[string]struct{}, len(activeKeys))
 	for _, key := range activeKeys {
@@ -248,9 +277,9 @@ func (p *weightedDeficitRoundRobin) cleanupDeficits(activeKeys []types.FlowKey) 
 	}
 
 	// Remove deficits for inactive flows
-	for flowID := range p.deficits {
+	for flowID := range state.deficits {
 		if _, exists := activeFlows[flowID]; !exists {
-			delete(p.deficits, flowID)
+			delete(state.deficits, flowID)
 		}
 	}
 }

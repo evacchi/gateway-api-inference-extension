@@ -17,6 +17,7 @@ limitations under the License.
 package interflow
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -25,6 +26,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/flowcontrol/framework"
 	frameworkmocks "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/flowcontrol/framework/mocks"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/flowcontrol/types"
 )
@@ -202,40 +204,50 @@ func TestWDRRConfig_Validate(t *testing.T) {
 
 func TestWDRR_Name(t *testing.T) {
 	t.Parallel()
-	policy := NewWDRR(nil)
-	assert.Equal(t, WDRRPolicyName, policy.Name(), "Name should match the policy's constant")
+	policy := NewWDRR("test-wdrr", nil)
+	assert.Equal(t, "test-wdrr", policy.TypedName().Name, "Name should match the provided name")
+	assert.Equal(t, WDRRPolicyName, policy.TypedName().Type, "Type should match the policy's constant")
 }
 
 func TestWDRR_DefaultConfig(t *testing.T) {
 	t.Parallel()
-	policy := NewWDRR(nil)
+	policy := NewWDRR("", nil)
 	assert.NotNil(t, policy, "Policy should be created with nil config")
-	assert.Equal(t, WDRRPolicyName, policy.Name(), "Policy should have correct name")
+	assert.Equal(t, WDRRPolicyName, policy.TypedName().Name, "Policy should have correct name")
 }
 
 func TestWDRR_SelectQueue_NilBand(t *testing.T) {
 	t.Parallel()
-	policy := NewWDRR(nil)
+	policy := NewWDRR("", nil)
+	ctx := context.Background()
 
-	selected, err := policy.SelectQueue(nil)
-	require.NoError(t, err, "SelectQueue should not error on nil band")
-	assert.Nil(t, selected, "SelectQueue should return nil when band is nil")
+	selected, err := policy.Pick(ctx, nil)
+	require.NoError(t, err, "Pick should not error on nil band")
+	assert.Nil(t, selected, "Pick should return nil when band is nil")
 }
 
 func TestWDRR_SelectQueue_EmptyBand(t *testing.T) {
 	t.Parallel()
-	policy := NewWDRR(nil)
+	policy := NewWDRR("", nil)
+	ctx := context.Background()
+	state := policy.NewState(ctx)
 
-	mockBand := newTestBand() // Empty band
+	mockBand := &frameworkmocks.MockPriorityBandAccessor{
+		PolicyStateV: state,
+		FlowKeysFunc: func() []types.FlowKey { return []types.FlowKey{} },
+		QueueFunc:    func(id string) framework.FlowQueueAccessor { return nil },
+		IterateQueuesFunc: func(iterator func(flow framework.FlowQueueAccessor) bool) {},
+	}
 
-	selected, err := policy.SelectQueue(mockBand)
-	require.NoError(t, err, "SelectQueue should not error on empty band")
-	assert.Nil(t, selected, "SelectQueue should return nil when band is empty")
+	selected, err := policy.Pick(ctx, mockBand)
+	require.NoError(t, err, "Pick should not error on empty band")
+	assert.Nil(t, selected, "Pick should return nil when band is empty")
 }
 
 func TestWDRR_SelectQueue_AllEmptyQueues(t *testing.T) {
 	t.Parallel()
-	policy := NewWDRR(nil)
+	ctx := context.Background()
+	policy := NewWDRR("", nil)
 
 	// Three empty queues
 	emptyFlow1Key := types.FlowKey{ID: "empty1", Priority: 0}
@@ -247,17 +259,19 @@ func TestWDRR_SelectQueue_AllEmptyQueues(t *testing.T) {
 	queue3 := &frameworkmocks.MockFlowQueueAccessor{LenV: 0, FlowKeyV: emptyFlow3Key}
 
 	mockBand := newTestBand(queue1, queue2, queue3)
+	mockBand.PolicyStateV = policy.NewState(ctx)
 
-	selected, err := policy.SelectQueue(mockBand)
+	selected, err := policy.Pick(ctx, mockBand)
 	require.NoError(t, err, "SelectQueue should not error when all queues are empty")
 	assert.Nil(t, selected, "SelectQueue should return nil when all queues are empty")
 }
 
 func TestWDRR_SelectQueue_EqualWeights(t *testing.T) {
 	t.Parallel()
+	ctx := context.Background()
 
 	// All flows have equal weight (default=1)
-	policy := NewWDRR(DefaultWDRRConfig())
+	policy := NewWDRR("", DefaultWDRRConfig())
 
 	flow1Key := types.FlowKey{ID: "flow1", Priority: 0}
 	flow2Key := types.FlowKey{ID: "flow2", Priority: 0}
@@ -268,11 +282,12 @@ func TestWDRR_SelectQueue_EqualWeights(t *testing.T) {
 	queue3 := &frameworkmocks.MockFlowQueueAccessor{LenV: 5, FlowKeyV: flow3Key}
 
 	mockBand := newTestBand(queue1, queue2, queue3)
+	mockBand.PolicyStateV = policy.NewState(ctx)
 
 	// Track selections over multiple rounds
 	selectionCounts := make(map[string]int)
 	for i := range 30 {
-		selected, err := policy.SelectQueue(mockBand)
+		selected, err := policy.Pick(ctx, mockBand)
 		require.NoError(t, err, "SelectQueue should not error on iteration %d", i)
 		require.NotNil(t, selected, "SelectQueue should select a queue on iteration %d", i)
 		selectionCounts[selected.FlowKey().ID]++
@@ -291,6 +306,7 @@ func TestWDRR_SelectQueue_EqualWeights(t *testing.T) {
 
 func TestWDRR_SelectQueue_WeightedPriority(t *testing.T) {
 	t.Parallel()
+	ctx := context.Background()
 
 	// Configure weights: flow1=5, flow2=1, flow3=1
 	config := DefaultWDRRConfig()
@@ -299,7 +315,7 @@ func TestWDRR_SelectQueue_WeightedPriority(t *testing.T) {
 		"flow2": 1,
 		"flow3": 1,
 	}
-	policy := NewWDRR(config)
+	policy := NewWDRR("", config)
 
 	flow1Key := types.FlowKey{ID: "flow1", Priority: 0}
 	flow2Key := types.FlowKey{ID: "flow2", Priority: 0}
@@ -311,11 +327,12 @@ func TestWDRR_SelectQueue_WeightedPriority(t *testing.T) {
 
 	mockBand := newTestBand(queue1, queue2, queue3)
 
+	mockBand.PolicyStateV = policy.NewState(ctx)
 	// Track selections over many rounds
 	selectionCounts := make(map[string]int)
 	numSelections := 70 // Total weight is 5+1+1=7, so 70 selections = 10 full weight cycles
 	for i := range numSelections {
-		selected, err := policy.SelectQueue(mockBand)
+		selected, err := policy.Pick(ctx, mockBand)
 		require.NoError(t, err, "SelectQueue should not error on iteration %d", i)
 		require.NotNil(t, selected, "SelectQueue should select a queue on iteration %d", i)
 		selectionCounts[selected.FlowKey().ID]++
@@ -338,12 +355,13 @@ func TestWDRR_SelectQueue_WeightedPriority(t *testing.T) {
 
 func TestWDRR_SelectQueue_LoadBasedQuantumBoost(t *testing.T) {
 	t.Parallel()
+	ctx := context.Background()
 
 	// Configure with load threshold=10, boost factor=0.5
 	config := DefaultWDRRConfig()
 	config.LoadThreshold = 10
 	config.LoadBoostFactor = 0.5
-	policy := NewWDRR(config)
+	policy := NewWDRR("", config)
 
 	flow1Key := types.FlowKey{ID: "highLoad", Priority: 0}
 	flow2Key := types.FlowKey{ID: "lowLoad", Priority: 0}
@@ -355,11 +373,12 @@ func TestWDRR_SelectQueue_LoadBasedQuantumBoost(t *testing.T) {
 
 	mockBand := newTestBand(queueHighLoad, queueLowLoad)
 
+	mockBand.PolicyStateV = policy.NewState(ctx)
 	// Track selections over many rounds
 	selectionCounts := make(map[string]int)
 	numSelections := 60
 	for i := range numSelections {
-		selected, err := policy.SelectQueue(mockBand)
+		selected, err := policy.Pick(ctx, mockBand)
 		require.NoError(t, err, "SelectQueue should not error on iteration %d", i)
 		require.NotNil(t, selected, "SelectQueue should select a queue on iteration %d", i)
 		selectionCounts[selected.FlowKey().ID]++
@@ -375,6 +394,7 @@ func TestWDRR_SelectQueue_LoadBasedQuantumBoost(t *testing.T) {
 
 func TestWDRR_SelectQueue_AntiStarvation(t *testing.T) {
 	t.Parallel()
+	ctx := context.Background()
 
 	// Configure: highPriority=10, lowPriority=1
 	config := DefaultWDRRConfig()
@@ -383,7 +403,7 @@ func TestWDRR_SelectQueue_AntiStarvation(t *testing.T) {
 		"lowPriority":  1,
 	}
 	config.MinQuantum = 1 // Guarantee minimum service
-	policy := NewWDRR(config)
+	policy := NewWDRR("", config)
 
 	highPriorityKey := types.FlowKey{ID: "highPriority", Priority: 0}
 	lowPriorityKey := types.FlowKey{ID: "lowPriority", Priority: 0}
@@ -395,12 +415,13 @@ func TestWDRR_SelectQueue_AntiStarvation(t *testing.T) {
 	mockBand := newTestBand(queueHigh, queueLow)
 
 	// Track selections
+	mockBand.PolicyStateV = policy.NewState(ctx)
 	selectionCounts := make(map[string]int)
 	lowPriorityFirstSelection := -1
 	numSelections := 100
 
 	for i := range numSelections {
-		selected, err := policy.SelectQueue(mockBand)
+		selected, err := policy.Pick(ctx, mockBand)
 		require.NoError(t, err, "SelectQueue should not error on iteration %d", i)
 		require.NotNil(t, selected, "SelectQueue should select a queue on iteration %d", i)
 
@@ -433,17 +454,28 @@ func TestWDRR_SelectQueue_AntiStarvation(t *testing.T) {
 
 func TestWDRR_SelectQueue_DeficitCapping(t *testing.T) {
 	t.Parallel()
+	ctx := context.Background()
 
 	// Configure with small MaxDeficit to test capping
 	config := DefaultWDRRConfig()
 	config.MaxDeficit = 30
 	config.BaseQuantum = 20
-	policy := NewWDRR(config).(*weightedDeficitRoundRobin) // Type assert to access internal state
+	policy := NewWDRR("", config)
 
 	flowKey := types.FlowKey{ID: "flow1", Priority: 0}
 	queue := &frameworkmocks.MockFlowQueueAccessor{LenV: 100, FlowKeyV: flowKey}
 
-	mockBand := newTestBand(queue)
+	state := policy.NewState(ctx).(*wdrrState)
+	mockBand := &frameworkmocks.MockPriorityBandAccessor{
+		PolicyStateV: state,
+		FlowKeysFunc: func() []types.FlowKey { return []types.FlowKey{flowKey} },
+		QueueFunc:    func(id string) framework.FlowQueueAccessor {
+			if id == "flow1" {
+				return queue
+			}
+			return nil
+		},
+	}
 
 	// Make several selections to build up deficit beyond MaxDeficit
 	// First call: deficit = 0, gets refilled to 20 (1*20), selected, deficit = 19
@@ -453,14 +485,14 @@ func TestWDRR_SelectQueue_DeficitCapping(t *testing.T) {
 	// We want to verify it never exceeds MaxDeficit=30
 
 	for i := range 50 {
-		selected, err := policy.SelectQueue(mockBand)
+		selected, err := policy.Pick(ctx, mockBand)
 		require.NoError(t, err, "SelectQueue should not error on iteration %d", i)
 		require.NotNil(t, selected, "SelectQueue should select a queue on iteration %d", i)
 
 		// Check that deficit is capped at MaxDeficit
-		policy.mu.Lock()
-		deficit := policy.deficits["flow1"]
-		policy.mu.Unlock()
+		state.mu.Lock()
+		deficit := state.deficits["flow1"]
+		state.mu.Unlock()
 
 		assert.LessOrEqual(t, deficit, config.MaxDeficit,
 			"Deficit should be capped at MaxDeficit=%d, but got %d at iteration %d",
@@ -470,7 +502,8 @@ func TestWDRR_SelectQueue_DeficitCapping(t *testing.T) {
 
 func TestWDRR_SelectQueue_DynamicFlows(t *testing.T) {
 	t.Parallel()
-	policy := NewWDRR(DefaultWDRRConfig())
+	ctx := context.Background()
+	policy := NewWDRR("", DefaultWDRRConfig())
 
 	flow1Key := types.FlowKey{ID: "flow1", Priority: 0}
 	flow2Key := types.FlowKey{ID: "flow2", Priority: 0}
@@ -483,19 +516,21 @@ func TestWDRR_SelectQueue_DynamicFlows(t *testing.T) {
 	mockBand := newTestBand(queue1, queue2)
 
 	// Make some selections
+	mockBand.PolicyStateV = policy.NewState(ctx)
 	for i := range 5 {
-		_, err := policy.SelectQueue(mockBand)
+		_, err := policy.Pick(ctx, mockBand)
 		require.NoError(t, err, "SelectQueue should not error on initial iteration %d", i)
 	}
 
 	// Add a third flow
 	queue3 := &frameworkmocks.MockFlowQueueAccessor{LenV: 5, FlowKeyV: flow3Key}
 	mockBand = newTestBand(queue1, queue2, queue3)
+	mockBand.PolicyStateV = policy.NewState(ctx)
 
 	// Continue selections - should handle new flow gracefully
 	selectionCounts := make(map[string]int)
 	for i := range 15 {
-		selected, err := policy.SelectQueue(mockBand)
+		selected, err := policy.Pick(ctx, mockBand)
 		require.NoError(t, err, "SelectQueue should not error on iteration %d", i)
 		if selected != nil {
 			selectionCounts[selected.FlowKey().ID]++
@@ -518,7 +553,8 @@ func TestWDRR_SelectQueue_Concurrency(t *testing.T) {
 	for i := range 3 {
 		t.Run(fmt.Sprintf("Iteration%d", i), func(t *testing.T) {
 			t.Parallel()
-			policy := NewWDRR(DefaultWDRRConfig())
+			ctx := context.Background()
+			policy := NewWDRR("", DefaultWDRRConfig())
 
 			flow1Key := types.FlowKey{ID: "flow1", Priority: 0}
 			flow2Key := types.FlowKey{ID: "flow2", Priority: 0}
@@ -531,6 +567,7 @@ func TestWDRR_SelectQueue_Concurrency(t *testing.T) {
 			mockBand := newTestBand(queue1, queue2, queue3)
 
 			var wg sync.WaitGroup
+			mockBand.PolicyStateV = policy.NewState(ctx)
 			numGoroutines := 10
 			selectionsPerGoroutine := 30
 			totalSelections := int64(numGoroutines * selectionsPerGoroutine)
@@ -542,7 +579,7 @@ func TestWDRR_SelectQueue_Concurrency(t *testing.T) {
 				go func() {
 					defer wg.Done()
 					for range selectionsPerGoroutine {
-						selected, err := policy.SelectQueue(mockBand)
+						selected, err := policy.Pick(ctx, mockBand)
 						if err == nil && selected != nil {
 							val, _ := selectionCounts.LoadOrStore(selected.FlowKey().ID, new(atomic.Int64))
 							val.(*atomic.Int64).Add(1)
@@ -569,13 +606,14 @@ func TestWDRR_SelectQueue_Concurrency(t *testing.T) {
 
 func TestWDRR_SelectQueue_ByteSizeMode(t *testing.T) {
 	t.Parallel()
+	ctx := context.Background()
 
 	// Configure to use ByteSize instead of Len
 	config := DefaultWDRRConfig()
 	config.UseByteSize = true
 	config.LoadThreshold = 1000 // 1KB threshold
 	config.LoadBoostFactor = 0.5
-	policy := NewWDRR(config)
+	policy := NewWDRR("", config)
 
 	flow1Key := types.FlowKey{ID: "largeBytes", Priority: 0}
 	flow2Key := types.FlowKey{ID: "smallBytes", Priority: 0}
@@ -596,9 +634,10 @@ func TestWDRR_SelectQueue_ByteSizeMode(t *testing.T) {
 	mockBand := newTestBand(queueLarge, queueSmall)
 
 	// Track selections
+	mockBand.PolicyStateV = policy.NewState(ctx)
 	selectionCounts := make(map[string]int)
 	for i := range 40 {
-		selected, err := policy.SelectQueue(mockBand)
+		selected, err := policy.Pick(ctx, mockBand)
 		require.NoError(t, err, "SelectQueue should not error on iteration %d", i)
 		require.NotNil(t, selected, "SelectQueue should select a queue on iteration %d", i)
 		selectionCounts[selected.FlowKey().ID]++
