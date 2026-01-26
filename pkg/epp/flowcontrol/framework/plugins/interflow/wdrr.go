@@ -20,7 +20,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math"
 	"slices"
 	"sync"
 
@@ -42,21 +41,18 @@ func init() {
 // weightedDeficitRoundRobin implements the `framework.FairnessPolicy` interface using the
 // Weighted Deficit Round Robin (WDRR) algorithm.
 //
-// WDRR provides anti-starvation guarantees while supporting weighted priorities and load-aware adaptation.
+// WDRR provides anti-starvation guarantees while supporting weighted priorities.
 //
 // Algorithm overview:
 //  1. Each flow maintains a "deficit counter" that accumulates credits each round
-//  2. Each round, flows receive a "quantum" of work they're allowed to do
+//  2. Each round, flows receive a "quantum" of work they're allowed to do (quantum = BaseQuantum * weight)
 //  3. Higher-weight flows receive larger quantums
-//  4. Load-aware: quantum increases for high-load queues
-//  5. Anti-starvation: every flow gets at least MinQuantum, ensuring bounded wait time
+//  4. Anti-starvation: every flow gets at least MinQuantum, ensuring bounded wait time
 //
 // Thread-safety: All state mutations are protected by a single mutex.
 type weightedDeficitRoundRobin struct {
-	name        string      // Plugin instance name
-	config      *WDRRConfig // Immutable configuration (can be read without lock after construction)
-	currentLoad func(queue framework.FlowQueueAccessor) int
-	applyBoost  func(currentLoad int, baseQuantum int64) int64
+	name   string      // Plugin instance name
+	config *WDRRConfig // Immutable configuration (can be read without lock after construction)
 }
 
 // wdrrState holds the mutable state for a specific priority band.
@@ -83,35 +79,10 @@ func NewWDRR(name string, config *WDRRConfig) framework.FairnessPolicy {
 	if err := config.Validate(); err != nil {
 		panic(err) // Configuration errors are programming errors, fail fast
 	}
-	var calcLoad func(queue framework.FlowQueueAccessor) int
-	if config.UseByteSize {
-		calcLoad = func(queue framework.FlowQueueAccessor) int {
-			return int(queue.ByteSize())
-		}
-	} else {
-		calcLoad = func(queue framework.FlowQueueAccessor) int {
-			return queue.Len()
-		}
-	}
-	var applyBoost func(currentLoad int, baseQuantum int64) int64
-	if config.LoadBoostFactor > 0 {
-		applyBoost = func(currentLoad int, baseQuantum int64) int64 {
-			if currentLoad > config.LoadThreshold {
-				loadFactor := float64(currentLoad) / float64(config.LoadThreshold)
-				boost := (loadFactor - 1.0) * config.LoadBoostFactor
-				return int64(math.Round(float64(baseQuantum) * (1.0 + boost)))
-			}
-			return baseQuantum
-		}
-	} else {
-		applyBoost = func(currentLoad int, baseQuantum int64) int64 { return baseQuantum }
-	}
 
 	return &weightedDeficitRoundRobin{
-		name:        name,
-		config:      config,
-		currentLoad: calcLoad,
-		applyBoost:  applyBoost,
+		name:   name,
+		config: config,
 	}
 }
 
@@ -211,43 +182,24 @@ func (p *weightedDeficitRoundRobin) Pick(
 	return nil, nil
 }
 
-// calculateQuantum computes the quantum for a given queue based on its weight and current load.
+// calculateQuantum computes the quantum for a given queue based on its weight.
 //
 // Formula:
 //
 //	weight = FlowWeights[flowID] or DefaultWeight if not specified
-//	baseQuantum = BaseQuantum * weight
-//	currentLoad = queue.Len() or queue.ByteSize() (depending on UseByteSize)
-//
-//	if currentLoad > LoadThreshold:
-//	  loadFactor = currentLoad / LoadThreshold
-//	  boost = (loadFactor - 1.0) * LoadBoostFactor
-//	  adjustedQuantum = baseQuantum * (1.0 + boost)
-//	else:
-//	  adjustedQuantum = baseQuantum
-//
-//	return max(adjustedQuantum, MinQuantum)
+//	quantum = BaseQuantum * weight
+//	return max(quantum, MinQuantum)
 //
 // This ensures:
 //  1. Higher-weight flows get more quantum (weighted fairness)
-//  2. High-load queues get boosted quantum (load adaptation)
-//  3. Every flow gets at least MinQuantum (anti-starvation)
+//  2. Every flow gets at least MinQuantum (anti-starvation)
 func (p *weightedDeficitRoundRobin) calculateQuantum(queue framework.FlowQueueAccessor) int64 {
 	flowID := queue.FlowKey().ID
-
 	weight := p.weight(flowID)
-	baseQuantum := p.config.BaseQuantum * int64(weight)
-	currentLoad := p.currentLoad(queue)
-
-	// Apply load-based boost if above threshold
-	adjustedQuantum := p.applyBoost(currentLoad, baseQuantum)
+	quantum := p.config.BaseQuantum * int64(weight)
 
 	// Ensure minimum quantum (anti-starvation guarantee)
-	if adjustedQuantum < p.config.MinQuantum {
-		adjustedQuantum = p.config.MinQuantum
-	}
-
-	return adjustedQuantum
+	return max(quantum, p.config.MinQuantum)
 }
 
 // weight returns the weight for a given flow ID.

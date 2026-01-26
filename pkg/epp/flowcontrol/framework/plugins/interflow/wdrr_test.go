@@ -53,10 +53,7 @@ func TestWDRRConfig_Validate(t *testing.T) {
 				DefaultWeight:   2,
 				BaseQuantum:     20,
 				MinQuantum:      2,
-				LoadThreshold:   15,
-				LoadBoostFactor: 0.75,
 				MaxDeficit:      200,
-				UseByteSize:     true,
 			},
 			expectError: false,
 		},
@@ -67,8 +64,6 @@ func TestWDRRConfig_Validate(t *testing.T) {
 				DefaultWeight:   0,
 				BaseQuantum:     10,
 				MinQuantum:      1,
-				LoadThreshold:   10,
-				LoadBoostFactor: 0.5,
 				MaxDeficit:      100,
 			},
 			expectError: true,
@@ -81,8 +76,6 @@ func TestWDRRConfig_Validate(t *testing.T) {
 				DefaultWeight:   -1,
 				BaseQuantum:     10,
 				MinQuantum:      1,
-				LoadThreshold:   10,
-				LoadBoostFactor: 0.5,
 				MaxDeficit:      100,
 			},
 			expectError: true,
@@ -95,8 +88,6 @@ func TestWDRRConfig_Validate(t *testing.T) {
 				DefaultWeight:   1,
 				BaseQuantum:     0,
 				MinQuantum:      1,
-				LoadThreshold:   10,
-				LoadBoostFactor: 0.5,
 				MaxDeficit:      100,
 			},
 			expectError: true,
@@ -109,40 +100,10 @@ func TestWDRRConfig_Validate(t *testing.T) {
 				DefaultWeight:   1,
 				BaseQuantum:     10,
 				MinQuantum:      0,
-				LoadThreshold:   10,
-				LoadBoostFactor: 0.5,
 				MaxDeficit:      100,
 			},
 			expectError: true,
 			errorMsg:    "MinQuantum must be positive",
-		},
-		{
-			name: "Invalid LoadThreshold (zero)",
-			config: &WDRRConfig{
-				FlowWeights:     make(map[string]int),
-				DefaultWeight:   1,
-				BaseQuantum:     10,
-				MinQuantum:      1,
-				LoadThreshold:   0,
-				LoadBoostFactor: 0.5,
-				MaxDeficit:      100,
-			},
-			expectError: true,
-			errorMsg:    "LoadThreshold must be positive",
-		},
-		{
-			name: "Invalid LoadBoostFactor (negative)",
-			config: &WDRRConfig{
-				FlowWeights:     make(map[string]int),
-				DefaultWeight:   1,
-				BaseQuantum:     10,
-				MinQuantum:      1,
-				LoadThreshold:   10,
-				LoadBoostFactor: -0.5,
-				MaxDeficit:      100,
-			},
-			expectError: true,
-			errorMsg:    "LoadBoostFactor must be non-negative",
 		},
 		{
 			name: "Invalid MaxDeficit (zero)",
@@ -151,8 +112,6 @@ func TestWDRRConfig_Validate(t *testing.T) {
 				DefaultWeight:   1,
 				BaseQuantum:     10,
 				MinQuantum:      1,
-				LoadThreshold:   10,
-				LoadBoostFactor: 0.5,
 				MaxDeficit:      0,
 			},
 			expectError: true,
@@ -165,8 +124,6 @@ func TestWDRRConfig_Validate(t *testing.T) {
 				DefaultWeight:   1,
 				BaseQuantum:     10,
 				MinQuantum:      1,
-				LoadThreshold:   10,
-				LoadBoostFactor: 0.5,
 				MaxDeficit:      100,
 			},
 			expectError: true,
@@ -179,8 +136,6 @@ func TestWDRRConfig_Validate(t *testing.T) {
 				DefaultWeight:   1,
 				BaseQuantum:     10,
 				MinQuantum:      1,
-				LoadThreshold:   10,
-				LoadBoostFactor: 0.5,
 				MaxDeficit:      100,
 			},
 			expectError: true,
@@ -351,45 +306,6 @@ func TestWDRR_SelectQueue_WeightedPriority(t *testing.T) {
 
 	t.Logf("Weighted distribution: flow1=%d (weight=5), flow2=%d (weight=1), flow3=%d (weight=1)",
 		selectionCounts["flow1"], selectionCounts["flow2"], selectionCounts["flow3"])
-}
-
-func TestWDRR_SelectQueue_LoadBasedQuantumBoost(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-
-	// Configure with load threshold=10, boost factor=0.5
-	config := DefaultWDRRConfig()
-	config.LoadThreshold = 10
-	config.LoadBoostFactor = 0.5
-	policy := NewWDRR("", config)
-
-	flow1Key := types.FlowKey{ID: "highLoad", Priority: 0}
-	flow2Key := types.FlowKey{ID: "lowLoad", Priority: 0}
-
-	// High load queue (30 items, 3x threshold)
-	queueHighLoad := &frameworkmocks.MockFlowQueueAccessor{LenV: 30, FlowKeyV: flow1Key}
-	// Low load queue (5 items, below threshold)
-	queueLowLoad := &frameworkmocks.MockFlowQueueAccessor{LenV: 5, FlowKeyV: flow2Key}
-
-	mockBand := newTestBand(queueHighLoad, queueLowLoad)
-
-	mockBand.PolicyStateV = policy.NewState(ctx)
-	// Track selections over many rounds
-	selectionCounts := make(map[string]int)
-	numSelections := 60
-	for i := range numSelections {
-		selected, err := policy.Pick(ctx, mockBand)
-		require.NoError(t, err, "SelectQueue should not error on iteration %d", i)
-		require.NotNil(t, selected, "SelectQueue should select a queue on iteration %d", i)
-		selectionCounts[selected.FlowKey().ID]++
-	}
-
-	// High-load queue should get more selections due to load boost
-	assert.Greater(t, selectionCounts["highLoad"], selectionCounts["lowLoad"],
-		"High-load queue should be selected more frequently")
-
-	t.Logf("Load-based distribution: highLoad=%d (len=30), lowLoad=%d (len=5)",
-		selectionCounts["highLoad"], selectionCounts["lowLoad"])
 }
 
 func TestWDRR_SelectQueue_AntiStarvation(t *testing.T) {
@@ -602,53 +518,6 @@ func TestWDRR_SelectQueue_Concurrency(t *testing.T) {
 			t.Logf("Concurrent selection distribution: %s", countsStr)
 		})
 	}
-}
-
-func TestWDRR_SelectQueue_ByteSizeMode(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-
-	// Configure to use ByteSize instead of Len
-	config := DefaultWDRRConfig()
-	config.UseByteSize = true
-	config.LoadThreshold = 1000 // 1KB threshold
-	config.LoadBoostFactor = 0.5
-	policy := NewWDRR("", config)
-
-	flow1Key := types.FlowKey{ID: "largeBytes", Priority: 0}
-	flow2Key := types.FlowKey{ID: "smallBytes", Priority: 0}
-
-	// Large byte size queue (3KB)
-	queueLarge := &frameworkmocks.MockFlowQueueAccessor{
-		LenV:      1,
-		ByteSizeV: 3000,
-		FlowKeyV:  flow1Key,
-	}
-	// Small byte size queue (500 bytes)
-	queueSmall := &frameworkmocks.MockFlowQueueAccessor{
-		LenV:      1,
-		ByteSizeV: 500,
-		FlowKeyV:  flow2Key,
-	}
-
-	mockBand := newTestBand(queueLarge, queueSmall)
-
-	// Track selections
-	mockBand.PolicyStateV = policy.NewState(ctx)
-	selectionCounts := make(map[string]int)
-	for i := range 40 {
-		selected, err := policy.Pick(ctx, mockBand)
-		require.NoError(t, err, "SelectQueue should not error on iteration %d", i)
-		require.NotNil(t, selected, "SelectQueue should select a queue on iteration %d", i)
-		selectionCounts[selected.FlowKey().ID]++
-	}
-
-	// Large byte size queue should get more selections due to load boost
-	assert.Greater(t, selectionCounts["largeBytes"], selectionCounts["smallBytes"],
-		"Queue with larger byte size should be selected more frequently")
-
-	t.Logf("ByteSize mode distribution: largeBytes=%d (3KB), smallBytes=%d (500B)",
-		selectionCounts["largeBytes"], selectionCounts["smallBytes"])
 }
 
 func TestWDRR_SelectQueue_SkipsEmptyQueueWithPositiveDeficit(t *testing.T) {
