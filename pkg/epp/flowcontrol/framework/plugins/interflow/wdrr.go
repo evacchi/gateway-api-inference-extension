@@ -147,12 +147,14 @@ func (p *weightedDeficitRoundRobin) Pick(
 	state.mu.Lock()
 	defer state.mu.Unlock()
 
-	// Get and sort flow keys for deterministic ordering
 	keys := band.FlowKeys()
+	// No keys: early return
 	if len(keys) == 0 {
 		state.lastSelected = nil
 		return nil, nil
 	}
+
+	// Sort flow keys for deterministic ordering
 	slices.SortFunc(keys, func(a, b types.FlowKey) int { return a.Compare(b) })
 
 	// First, check if lastSelected flow still has deficit and is non-empty
