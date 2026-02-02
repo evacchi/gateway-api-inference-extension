@@ -29,6 +29,7 @@ import (
 
 	logutil "sigs.k8s.io/gateway-api-inference-extension/pkg/common/util/logging"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/flowcontrol/contracts"
+	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/flowcontrol/framework/plugins/saturation"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/flowcontrol/types"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/flowcontrol"
 )
@@ -66,6 +67,8 @@ type ShardProcessor struct {
 	shard                contracts.RegistryShard
 	saturationDetector   contracts.SaturationDetector
 	podLocator           contracts.PodLocator
+	usageLimitPolicy     flowcontrol.UsageLimitPolicy
+	evictor              flowcontrol.Evictor
 	clock                clock.WithTicker
 	cleanupSweepInterval time.Duration
 	logger               logr.Logger
@@ -97,6 +100,8 @@ func NewShardProcessor(
 		shard:                shard,
 		saturationDetector:   saturationDetector,
 		podLocator:           podLocator,
+		usageLimitPolicy:     saturation.NewDynamicUsagePolicy(), // TODO: Make this configurable
+		evictor:              saturation.NewNoOpEvictor(),        // TODO: Make this configurable
 		clock:                clock,
 		cleanupSweepInterval: cleanupSweepInterval,
 		logger:               logger,
@@ -308,15 +313,27 @@ func (sp *ShardProcessor) dispatchCycle(ctx context.Context) bool {
 			continue
 		}
 
-		// --- Viability Check (Saturation/HoL Blocking) ---
+		// --- Viability Check (Saturation/HoL Blocking and Usage Limit Gating) ---
 		req := item.OriginalRequest()
 		candidates := sp.podLocator.Locate(ctx, req.GetMetadata())
-		if sp.saturationDetector.Saturation(ctx, candidates) >= 1.0 {
-			sp.logger.V(logutil.DEBUG).Info("Policy's chosen item is saturated; enforcing HoL blocking.",
-				"flowKey", req.FlowKey(), "reqID", req.ID(), "priorityName", originalBand.PriorityName())
-			// Stop the dispatch cycle entirely to respect strict policy decision and prevent priority inversion where
-			// lower-priority work might exacerbate the saturation affecting high-priority work.
-			return false
+		saturation := sp.saturationDetector.Saturation(ctx, candidates)
+		usageLimit := sp.usageLimitPolicy.ComputeLimit(ctx, priority, saturation, req.GetMetadata())
+
+		if saturation >= usageLimit {
+			if saturation >= 1.0 {
+				// Fully saturated - enforce HoL blocking
+				sp.logger.V(logutil.DEBUG).Info("Policy's chosen item is saturated; enforcing HoL blocking.",
+					"flowKey", req.FlowKey(), "reqID", req.ID(), "priorityName", originalBand.PriorityName(),
+					"saturation", saturation, "usageLimit", usageLimit)
+				// Stop the dispatch cycle entirely to respect strict policy decision and prevent priority inversion where
+				// lower-priority work might exacerbate the saturation affecting high-priority work.
+				return false
+			}
+			// Gated by usage limit - try next priority band
+			sp.logger.V(logutil.DEBUG).Info("Priority band gated by usage limit; trying next priority.",
+				"flowKey", req.FlowKey(), "reqID", req.ID(), "priorityName", originalBand.PriorityName(),
+				"priority", priority, "saturation", saturation, "usageLimit", usageLimit)
+			continue
 		}
 
 		// --- Dispatch ---
@@ -327,6 +344,18 @@ func (sp *ShardProcessor) dispatchCycle(ctx context.Context) bool {
 		}
 		return true
 	}
+
+	// All priority bands are empty or gated - try eviction as last resort
+	// FIXME: define actual interface etc...
+	evicted, err := sp.evictor.Evict(ctx, 0.8)
+	if err != nil {
+		sp.logger.V(logutil.DEBUG).Info("Eviction failed", "error", err)
+	} else if evicted > 0 {
+		sp.logger.V(logutil.DEBUG).Info("Evicted queued requests to free capacity", "count", evicted)
+		// Eviction freed capacity, signal caller to retry dispatch
+		return true
+	}
+
 	return false
 }
 

@@ -115,3 +115,108 @@ type OrderingPolicy interface {
 	//     correctly.
 	RequiredQueueCapabilities() []QueueCapability
 }
+
+// UsageLimitPolicy computes dynamic capacity limits for each priority band based on observed queue metrics.
+//
+// This policy enables adaptive capacity management by adjusting usage limits in response to load patterns:
+//   - When queue depth is growing rapidly, tighten limits to reserve capacity for higher priorities
+//   - When queue depth is shrinking, relax limits to improve utilization
+//   - When queue depth is stable, maintain current limits
+//
+// The policy observes band-level metrics (queue depth, byte size, etc.) to compute trends and adjust the
+// maximum saturation threshold at which each priority band can dispatch requests.
+//
+// Architecture (Singleton with Internal State):
+// UsageLimitPolicy plugins are Singletons. A single instance handles limit computation for all priority bands
+// across all shards. The plugin maintains internal state (metric history, derivatives) per-priority to
+// enable trend-based decisions.
+//
+// Integration:
+// This policy is called during each dispatch cycle BEFORE selecting items, allowing it to observe band metrics
+// and compute appropriate capacity limits. The returned limit is then compared against item-specific saturation
+// to make gating decisions.
+//
+// Conformance: Implementations MUST ensure all methods are goroutine-safe.
+type UsageLimitPolicy interface {
+	plugin.Plugin
+
+	// ComputeLimit calculates the dynamic usage limit for the given priority band based on current and historical
+	// queue metrics.
+	//
+	// The implementation should:
+	//  1. Observe current band metrics (queue depth, byte size, etc.)
+	//  2. Compute derivatives (rate of change) from recent history
+	//  3. Adjust the usage limit based on trends:
+	//     - Growing queue (positive derivative) → lower limit (more conservative, reserve capacity)
+	//     - Shrinking queue (negative derivative) → higher limit (more aggressive, improve utilization)
+	//     - Stable queue (near-zero derivative) → maintain current limit
+	//  4. Return the computed limit as a float64 between 0.0 and 1.0
+	//
+	// Parameters:
+	//   - ctx: Request context for logging, tracing, etc.
+	//   - band: The priority band accessor providing queue metrics (Len(), ByteSize(), Priority(), etc.)
+	//
+	// Returns:
+	//   - limit: The maximum saturation threshold at which this priority can dispatch
+	//     - 0.0 = cannot dispatch (fully gated)
+	//     - 1.0 = can dispatch until fully saturated (no holdback)
+	//     - Values between 0.0 and 1.0 reserve capacity for higher priorities
+	//
+	// Example:
+	//   Priority 0 batch traffic has queue depth growing from 10→50→100 requests.
+	//   Gradient policy detects positive derivative (rapid queue growth).
+	//   ComputeLimit returns 0.75 to reserve 25% capacity for higher priorities.
+	//   Later, queue shrinks to 50→20→5. Negative derivative detected.
+	//   ComputeLimit relaxes to 0.95 to improve utilization.
+	ComputeLimit(ctx context.Context, priority int, saturation float64, requestMetadata map[string]any) (limit float64)
+}
+
+// Evictor handles capacity reclamation by terminating low-priority in-flight requests when the system
+// approaches saturation.
+//
+// When all priority bands are gated (cannot dispatch due to usage limits) and saturation remains high,
+// the Evictor provides a mechanism to free capacity by evicting work that is already in progress.
+// This enables high-priority bursts to preempt low-priority batch work.
+//
+// Eviction Strategy:
+// Implementations typically evict using a stack-based approach (LIFO within priority):
+//  1. Target the lowest priority level with in-flight requests
+//  2. Evict the most recently dispatched requests from that priority
+//  3. Continue until saturation drops below the target threshold or no evictable requests remain
+//
+// Architecture (Global Singleton):
+// Evictor plugins are global Singletons that operate across all shards and priority bands.
+// They require access to in-flight request tracking (e.g., metrics, request registries) to identify
+// and terminate running requests.
+//
+// Evictability:
+// Not all requests are evictable. Implementations should consider:
+//   - Only negative-priority requests may be evictable (as suggested in the design doc)
+//   - Requests that have progressed beyond a certain point may be protected
+//   - Critical workloads may be marked as non-evictable via metadata
+//
+// Conformance: Implementations MUST ensure all methods are goroutine-safe.
+type Evictor interface {
+	plugin.Plugin
+
+	// Evict attempts to free capacity by terminating low-priority in-flight requests.
+	//
+	// The implementation should:
+	//  1. Identify evictable in-flight requests (typically negative priorities, LIFO order)
+	//  2. Terminate requests until saturation drops below targetSaturation or no candidates remain
+	//  3. Return the count of evicted requests
+	//
+	// Parameters:
+	//   - ctx: Request context for logging, tracing, cancellation
+	//   - targetSaturation: The desired saturation level to achieve through eviction (e.g., 0.9)
+	//
+	// Returns:
+	//   - evicted: The number of requests successfully evicted
+	//   - err: Only returned for unrecoverable internal errors. Returning 0 evicted requests is not an error.
+	//
+	// Example:
+	//   Current saturation is 0.98 (near capacity). All priority bands are gated by their usage limits.
+	//   Evict(ctx, 0.90) might terminate 5 low-priority batch requests, dropping saturation to 0.89,
+	//   which then allows high-priority interactive traffic to dispatch.
+	Evict(ctx context.Context, targetSaturation float64) (evicted int, err error)
+}
