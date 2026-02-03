@@ -49,7 +49,12 @@ func (e *NoOpEvictor) TypedName() plugin.TypedName {
 	}
 }
 
-// Evict always returns 0 (no requests evicted).
-func (e *NoOpEvictor) Evict(ctx context.Context, targetSaturation float64) (int, error) {
+// ScheduleEviction does nothing (no-op).
+func (e *NoOpEvictor) ScheduleEvictionCandidate(ctx context.Context, queue flowcontrol.EvictableQueue, item flowcontrol.QueueItemAccessor, priority int, usageLimit float64) {
+	// No-op: don't schedule anything for eviction
+}
+
+// ProcessScheduled always returns 0 (no requests evicted).
+func (e *NoOpEvictor) ProcessScheduled(ctx context.Context) (int, error) {
 	return 0, nil
 }

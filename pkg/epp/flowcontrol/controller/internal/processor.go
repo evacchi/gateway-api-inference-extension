@@ -296,6 +296,14 @@ func (sp *ShardProcessor) hasCapacity(priority int, itemByteSize uint64) bool {
 // blocking to respect the policy's decision and prevent priority inversion, where dispatching lower-priority work might
 // exacerbate the saturation affecting the high-priority item.
 func (sp *ShardProcessor) dispatchCycle(ctx context.Context) bool {
+	// Schedule deferred eviction at the end of the dispatch cycle
+	defer func() {
+		if evicted, err := sp.evictor.ProcessScheduled(ctx); err != nil {
+			sp.logger.V(logutil.DEBUG).Info("Eviction processing failed", "error", err)
+		} else if evicted > 0 {
+			sp.logger.V(logutil.DEBUG).Info("Evicted queued requests to free capacity", "count", evicted)
+		}
+	}()
 	for _, priority := range sp.shard.AllOrderedPriorityLevels() {
 		originalBand, err := sp.shard.PriorityBandAccessor(priority)
 		if err != nil {
@@ -329,10 +337,16 @@ func (sp *ShardProcessor) dispatchCycle(ctx context.Context) bool {
 				// lower-priority work might exacerbate the saturation affecting high-priority work.
 				return false
 			}
-			// Gated by usage limit - try next priority band
-			sp.logger.V(logutil.DEBUG).Info("Priority band gated by usage limit; trying next priority.",
+			// Gated by usage limit - schedule for potential eviction
+			sp.logger.V(logutil.DEBUG).Info("Priority band gated by usage limit; scheduling for eviction.",
 				"flowKey", req.FlowKey(), "reqID", req.ID(), "priorityName", originalBand.PriorityName(),
 				"priority", priority, "saturation", saturation, "usageLimit", usageLimit)
+
+			if queue, err := sp.shard.ManagedQueue(req.FlowKey()); err != nil {
+				sp.logger.Error(err, "Failed to get ManagedQueue for eviction scheduling", "flowKey", req.FlowKey())
+			} else {
+				sp.evictor.ScheduleEvictionCandidate(ctx, queue, item, priority, usageLimit)
+			}
 			continue
 		}
 
@@ -342,17 +356,6 @@ func (sp *ShardProcessor) dispatchCycle(ctx context.Context) bool {
 				"flowKey", req.FlowKey(), "reqID", req.ID(), "priorityName", originalBand.PriorityName())
 			continue // Continue to the next band to maximize work conservation.
 		}
-		return true
-	}
-
-	// All priority bands are empty or gated - try eviction as last resort
-	// FIXME: define actual interface etc...
-	evicted, err := sp.evictor.Evict(ctx, 0.8)
-	if err != nil {
-		sp.logger.V(logutil.DEBUG).Info("Eviction failed", "error", err)
-	} else if evicted > 0 {
-		sp.logger.V(logutil.DEBUG).Info("Evicted queued requests to free capacity", "count", evicted)
-		// Eviction freed capacity, signal caller to retry dispatch
 		return true
 	}
 

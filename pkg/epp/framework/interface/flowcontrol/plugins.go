@@ -23,6 +23,14 @@ import (
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/plugin"
 )
 
+// EvictableQueue provides the minimal interface needed by evictors to remove items from queues.
+// This avoids import cycles by not depending on the contracts package.
+// Implementations of contracts.ManagedQueue satisfy this interface.
+type EvictableQueue interface {
+	// Remove atomically finds and removes an item from the queue using its handle.
+	Remove(handle QueueItemHandle) (QueueItemAccessor, error)
+}
+
 var (
 	// ErrIncompatiblePriorityType indicates that a FairnessPolicy attempted to compare items from two different flow
 	// queues whose ItemComparators have different ScoreType values, making a meaningful comparison impossible.
@@ -156,52 +164,82 @@ type UsageLimitPolicy interface {
 	ComputeLimit(ctx context.Context, priority int, saturation float64, requestMetadata map[string]any) (limit float64)
 }
 
-// Evictor handles capacity reclamation by terminating low-priority in-flight requests when the system
-// approaches saturation.
+// Evictor handles capacity reclamation by removing queued low-priority requests when the system
+// approaches saturation thresholds.
 //
-// When all priority bands are gated (cannot dispatch due to usage limits) and saturation remains high,
-// the Evictor provides a mechanism to free capacity by evicting work that is already in progress.
-// This enables high-priority bursts to preempt low-priority batch work.
+// Eviction Model (Two-Phase):
+// The evictor uses a two-phase approach to separate eviction candidate selection from actual removal:
 //
-// Eviction Strategy:
-// Implementations typically evict using a stack-based approach (LIFO within priority):
-//  1. Target the lowest priority level with in-flight requests
-//  2. Evict the most recently dispatched requests from that priority
-//  3. Continue until saturation drops below the target threshold or no evictable requests remain
+//  1. Selection Phase (during dispatch cycle):
+//     When a request is gated by usage limits, it is scheduled as an eviction candidate via ScheduleEviction.
+//     The framework passes the queue and item, allowing the evictor to track candidates for later removal.
 //
-// Architecture (Global Singleton):
-// Evictor plugins are global Singletons that operate across all shards and priority bands.
-// They require access to in-flight request tracking (e.g., metrics, request registries) to identify
-// and terminate running requests.
+//  2. Eviction Phase (end of dispatch cycle):
+//     ProcessScheduled is called to actually remove scheduled candidates from their queues.
+//     The evictor can apply its own logic to decide which candidates to evict based on current state.
 //
-// Evictability:
-// Not all requests are evictable. Implementations should consider:
-//   - Only negative-priority requests may be evictable (as suggested in the design doc)
-//   - Requests that have progressed beyond a certain point may be protected
-//   - Critical workloads may be marked as non-evictable via metadata
+// This two-phase design allows the evictor to:
+//   - Accumulate a window of gated items before making eviction decisions
+//   - Cancel scheduled evictions if saturation improves
+//   - Apply custom policies (e.g., LIFO, priority-based, time-based)
+//   - Batch removals for efficiency
+//
+// Usage Limit Integration:
+// Evictors work in coordination with UsageLimitPolicy:
+//   - Items gated by usage limits are scheduled for eviction
+//   - The evictor can observe saturation trends to decide whether to proceed with eviction
+//   - If saturation drops naturally, scheduled evictions can be cancelled
+//
+// Future: In-Flight Cancellation:
+// Currently, evictors operate only on queued requests. Future enhancements may support canceling
+// in-flight requests that are already executing. This would require additional infrastructure for
+// request lifecycle tracking and cancellation propagation.
 //
 // Conformance: Implementations MUST ensure all methods are goroutine-safe.
 type Evictor interface {
 	plugin.Plugin
 
-	// Evict attempts to free capacity by terminating low-priority in-flight requests.
+	// ScheduleEvictionCandidate registers a gated item as a candidate for eviction.
+	//
+	// This method is called during the dispatch cycle when an item cannot proceed due to usage limits.
+	// The evictor stores the queue, item, and gating context for potential removal during ProcessScheduled.
+	//
+	// The evictor may apply its own logic to decide whether to actually evict the item later:
+	//   - Track saturation trends (cancel evictions if saturation improves)
+	//   - Apply priority-based policies (evict lower priorities first)
+	//   - Use LIFO ordering (evict most recently scheduled first)
+	//   - Implement time-based windows (only evict if gated for > N seconds)
+	//   - Compare against usage limits (evict items further below their limit first)
+	//
+	// Parameters:
+	//   - ctx: Request context for logging, tracing
+	//   - queue: The queue containing the item (provides Remove capability)
+	//   - item: The gated item to potentially evict
+	//   - priority: The priority level of the item
+	//   - usageLimit: The usage limit that gated this item
+	ScheduleEvictionCandidate(ctx context.Context, queue EvictableQueue, item QueueItemAccessor, priority int, usageLimit float64)
+
+	// ProcessScheduled removes scheduled eviction candidates from their queues.
+	//
+	// This method is called at the end of each dispatch cycle to process items scheduled via ScheduleEviction.
+	// The evictor decides which candidates to actually remove based on its internal policy and current state.
 	//
 	// The implementation should:
-	//  1. Identify evictable in-flight requests (typically negative priorities, LIFO order)
-	//  2. Terminate requests until saturation drops below targetSaturation or no candidates remain
-	//  3. Return the count of evicted requests
+	//  1. Evaluate scheduled candidates (check if eviction is still needed)
+	//  2. Remove selected candidates from their queues using queue.Remove(handle) or queue.Cleanup(predicate)
+	//  3. Clear the schedule for the next cycle
+	//  4. Return the count of items actually evicted
 	//
 	// Parameters:
 	//   - ctx: Request context for logging, tracing, cancellation
-	//   - targetSaturation: The desired saturation level to achieve through eviction (e.g., 0.9)
 	//
 	// Returns:
-	//   - evicted: The number of requests successfully evicted
-	//   - err: Only returned for unrecoverable internal errors. Returning 0 evicted requests is not an error.
+	//   - evicted: The number of items successfully removed from queues
+	//   - err: Only returned for unrecoverable internal errors. Returning 0 evicted items is not an error.
 	//
 	// Example:
-	//   Current saturation is 0.98 (near capacity). All priority bands are gated by their usage limits.
-	//   Evict(ctx, 0.90) might terminate 5 low-priority batch requests, dropping saturation to 0.89,
-	//   which then allows high-priority interactive traffic to dispatch.
-	Evict(ctx context.Context, targetSaturation float64) (evicted int, err error)
+	//   During dispatch cycle: 50 items at priority -10 are gated, scheduled via ScheduleEvictionCandidate.
+	//   At end of cycle: ProcessScheduled checks saturation. Still high, so evicts 30 items (LIFO).
+	//   Returns evicted=30.
+	ProcessScheduled(ctx context.Context) (evicted int, err error)
 }
