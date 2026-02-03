@@ -193,7 +193,7 @@ func (p *DynamicUsagePolicy) ComputeLimit(
 //
 // This approach provides stable trend detection across multiple requests and avoids call-order dependencies.
 func (p *DynamicUsagePolicy) saturationTrend(requestMetadata map[string]any, saturation float64) float64 {
-	key := p.generateCacheKey(requestMetadata)
+	key := generateCacheKey(requestMetadata)
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -259,7 +259,7 @@ const (
 
 // generateCacheKey creates a deterministic string key representing the pod selection criteria.
 // It handles the "x-gateway-destination-endpoint-subset" structure specifically.
-func (p *DynamicUsagePolicy) generateCacheKey(reqMetadata map[string]any) string {
+func generateCacheKey(reqMetadata map[string]any) string {
 	// No Metadata -> All Pods
 	if reqMetadata == nil {
 		return defaultCacheKey
