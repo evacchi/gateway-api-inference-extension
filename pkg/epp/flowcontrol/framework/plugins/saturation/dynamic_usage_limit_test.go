@@ -201,18 +201,16 @@ func TestDynamicUsagePolicy_EndpointSubsetTracking(t *testing.T) {
 		policy.ComputeLimit(ctx, 0, 0.95, metadataSubsetA)
 		policy.clock.Sleep(10 * time.Millisecond)
 	}
+	limitSubsetA := policy.ComputeLimit(ctx, 0, 0.95, metadataSubsetA)
 
 	// Subset B remains at low saturation
 	limitSubsetB := policy.ComputeLimit(ctx, 0, 0.3, metadataSubsetB)
 
-	// KNOWN LIMITATION: Both subsets share the same limit for priority 0
-	// Even though subset B has low saturation, it gets the same throttled limit as subset A
-	require.Lessf(t, limitSubsetB, 0.9,
-		"UNEXPECTED: Subset B with low saturation has high limit: %f. "+
-			"This suggests limits might be per-(priority, subset) rather than per-priority", limitSubsetB)
-
-	t.Logf("KNOWN LIMITATION: Subset B is unnecessarily throttled (limit=%f) because it shares", limitSubsetB)
-	t.Logf("the same limit with Subset A at priority 0. Limits are per-priority, not per-(priority, subset).")
+	// Limits are tracked independently per (subset, priority) pair
+	require.Lessf(t, limitSubsetA, 0.9,
+		"Subset A with high saturation should be throttled, got %f", limitSubsetA)
+	require.Greaterf(t, limitSubsetB, 0.9,
+		"Subset B with low saturation should NOT be throttled, got %f", limitSubsetB)
 }
 
 func TestDynamicUsagePolicy_DifferentEndpointSubsetsHaveDifferentSlopes(t *testing.T) {
@@ -260,15 +258,10 @@ func TestDynamicUsagePolicy_DifferentEndpointSubsetsHaveDifferentSlopes(t *testi
 	require.Greater(t, slopeA, 0.0, "Subset A should have positive trend (rising: 0.5→0.7→0.9)")
 	require.InDelta(t, 0.0, slopeB, 0.01, "Subset B should have near-zero trend (stable: 0.5→0.5→0.5)")
 
-	// Part 2: Demonstrate that limits CLASH when using same priority
-	// Even though trends differ, the second call overwrites the first's limit
+	// Limits are tracked independently per (subset, priority)
 	limitA := policy.ComputeLimit(ctx, 0, 0.85, metadataSubsetA) // Rising trend → aggressive throttle
 	limitB := policy.ComputeLimit(ctx, 0, 0.85, metadataSubsetB) // Stable trend → gentler throttle
 
-	// KNOWN LIMITATION: limitB should be higher (less aggressive), but they may not reflect
-	// independent trends because limits are per-priority (the second call overwrites the first)
-	t.Logf("KNOWN LIMITATION: Different items in the same band may produce different usage limits")
-	t.Logf("Limit A (rising trend): %f", limitA)
-	t.Logf("Limit B (stable trend): %f", limitB)
-	require.NotEqual(t, limitA, limitB)
+	require.NotEqual(t, limitA, limitB, "Limits should differ based on independent trends")
+	require.Lessf(t, limitA, limitB, "Rising trend (A) should throttle more than stable trend (B)")
 }

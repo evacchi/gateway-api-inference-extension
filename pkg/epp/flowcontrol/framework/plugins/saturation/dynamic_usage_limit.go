@@ -19,6 +19,7 @@ package saturation
 import (
 	"context"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -72,7 +73,7 @@ type DynamicUsagePolicy struct {
 
 	// mul protects the usageLimits map.
 	mul         sync.Mutex
-	usageLimits map[int]usageLimitEntry
+	usageLimits map[string]usageLimitEntry
 }
 
 // usageLimitEntry tracks the limit and when it was last updated for decay purposes.
@@ -96,7 +97,7 @@ func NewDynamicUsagePolicy(clk clock.Clock) *DynamicUsagePolicy {
 		name:        DynamicUsageLimitPolicyType,
 		clock:       clk,
 		saturations: make(map[string][]saturationSample),
-		usageLimits: make(map[int]usageLimitEntry),
+		usageLimits: make(map[string]usageLimitEntry),
 	}
 }
 
@@ -127,7 +128,8 @@ func (p *DynamicUsagePolicy) ComputeLimit(
 	defer p.mul.Unlock()
 
 	now := p.clock.Now()
-	entry, ok := p.usageLimits[priority]
+	cacheKey := generateUsageLimitCacheKey(requestMetadata, priority)
+	entry, ok := p.usageLimits[cacheKey]
 	u := 1.0 // Default usage limit
 	if ok {
 		u = entry.limit
@@ -177,7 +179,7 @@ func (p *DynamicUsagePolicy) ComputeLimit(
 	// clamp within [0,1]
 	u = max(0.0, min(1.0, u))
 
-	p.usageLimits[priority] = usageLimitEntry{
+	p.usageLimits[cacheKey] = usageLimitEntry{
 		limit:      u,
 		lastUpdate: now,
 	}
@@ -259,6 +261,15 @@ func slope(samples []saturationSample) float64 {
 	}
 
 	return (n*tsSum - tSum*sSum) / denominator
+}
+
+// generateUsageLimitCacheKey creates a composite cache key from endpoint subset and priority.
+// This ensures that usage limits are tracked independently for each (subset, priority) pair.
+// FIXME: should also implement cache eviction
+func generateUsageLimitCacheKey(reqMetadata map[string]any, priority int) string {
+	subsetKey := generateCacheKey(reqMetadata)
+	// Use a separator that won't appear in endpoint addresses to avoid collisions
+	return subsetKey + "::" + strconv.Itoa(priority)
 }
 
 // following: lifted from locator.go
