@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"k8s.io/utils/clock"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/flowcontrol"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/plugin"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/metadata"
@@ -31,7 +32,10 @@ import (
 const (
 	// DynamicUsageLimitPolicyType is the type of the dynamic usage limit policy plugin.
 	DynamicUsageLimitPolicyType = "dynamic-usage-limit-policy"
+)
 
+// Private const values. These might evolve into config.
+const (
 	// defaultTargetSaturation is the saturation threshold above which we start throttling.
 	// When saturation exceeds this value, limits decrease proportionally to the overshoot.
 	defaultTargetSaturation = 0.8
@@ -59,11 +63,12 @@ const (
 // It attempts to maintain saturation near a target threshold by throttling low-priority traffic more aggressively
 // when saturation is high or rising, and recovering limits when saturation is low or falling.
 type DynamicUsagePolicy struct {
-	name string
+	name  string
+	clock clock.Clock
 
 	// mu protects the saturations map.
 	mu          sync.Mutex
-	saturations map[string]saturationEntry
+	saturations map[string][]saturationSample
 
 	// mul protects the usageLimits map.
 	mul         sync.Mutex
@@ -76,12 +81,6 @@ type usageLimitEntry struct {
 	lastUpdate time.Time
 }
 
-// saturationEntry tracks saturation samples over time for trend analysis.
-type saturationEntry struct {
-	samples []saturationSample
-	expiry  time.Time
-}
-
 // saturationSample represents a single saturation measurement at a point in time.
 type saturationSample struct {
 	saturation float64
@@ -91,10 +90,12 @@ type saturationSample struct {
 var _ flowcontrol.UsageLimitPolicy = &DynamicUsagePolicy{}
 
 // NewDynamicUsagePolicy creates a new dynamic usage limit policy.
-func NewDynamicUsagePolicy() *DynamicUsagePolicy {
+// The clock parameter is used for time-based operations (decay, trend tracking).
+func NewDynamicUsagePolicy(clk clock.Clock) *DynamicUsagePolicy {
 	return &DynamicUsagePolicy{
 		name:        DynamicUsageLimitPolicyType,
-		saturations: make(map[string]saturationEntry),
+		clock:       clk,
+		saturations: make(map[string][]saturationSample),
 		usageLimits: make(map[int]usageLimitEntry),
 	}
 }
@@ -109,7 +110,7 @@ func (p *DynamicUsagePolicy) TypedName() plugin.TypedName {
 
 // ComputeLimit computes the dynamic usage limit for a given priority level based on current saturation
 // and saturation trends. The limit adjusts over time to maintain saturation near the target threshold
-// while being more aggressive with low-priority traffic.
+// while being more aggressive with low-priority (priority < 0) traffic.
 //
 // The algorithm:
 //  1. Applies decay to recover limits that have been idle (no requests for > idleTimeThreshold)
@@ -125,14 +126,15 @@ func (p *DynamicUsagePolicy) ComputeLimit(
 	p.mul.Lock()
 	defer p.mul.Unlock()
 
-	now := time.Now()
+	now := p.clock.Now()
 	entry, ok := p.usageLimits[priority]
 	u := 1.0 // Default usage limit
 	if ok {
 		u = entry.limit
-		// Apply decay if this priority has been idle
+		// If this priority has been idle, and we are below saturation,
+		// then apply decay.
 		idleTime := now.Sub(entry.lastUpdate)
-		if idleTime > idleTimeThreshold {
+		if idleTime > idleTimeThreshold && saturation < defaultTargetSaturation {
 			// Gradually recover toward 1.0
 			u = min(1.0, u+decayRate)
 		}
@@ -187,64 +189,76 @@ func (p *DynamicUsagePolicy) ComputeLimit(
 // the rate of change per second.
 //
 // Returns:
-//   - 0.0 if less than 2 samples exist (not enough history to detect a trend)
-//   - Rate of change in saturation units per second based on oldest vs newest sample in the window
-//   - Point-to-point delta if samples are too close together (< 1ms apart)
-//
-// This approach provides stable trend detection across multiple requests and avoids call-order dependencies.
+//   - 0.0 if less than 2 samples exist or the time distance within samples is too small
+//   - Slope of the fitted line in saturation units per second (can be positive, negative, or zero)
 func (p *DynamicUsagePolicy) saturationTrend(requestMetadata map[string]any, saturation float64) float64 {
 	key := generateCacheKey(requestMetadata)
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	now := time.Now()
+	now := p.clock.Now()
 	cutoff := now.Add(-sampleWindowDuration)
 
-	entry, found := p.saturations[key]
+	samples, found := p.saturations[key]
 	if found {
 		// Filter out old samples
-		validSamples := make([]saturationSample, 0, len(entry.samples)+1)
-		for _, s := range entry.samples {
+		validSamples := make([]saturationSample, 0, len(samples)+1)
+		for _, s := range samples {
 			if s.timestamp.After(cutoff) {
 				validSamples = append(validSamples, s)
 			}
 		}
-		entry.samples = validSamples
+		samples = validSamples
 	} else {
-		entry = saturationEntry{
-			samples: make([]saturationSample, 0, 10),
-		}
+		samples = make([]saturationSample, 0, 10)
 	}
 
 	// Add current sample
-	entry.samples = append(entry.samples, saturationSample{
+	samples = append(samples, saturationSample{
 		saturation: saturation,
 		timestamp:  now,
 	})
 
 	// Update saturations
-	p.saturations[key] = entry
+	p.saturations[key] = samples
 
 	// Compute delta/trend over the time window
-	if len(entry.samples) < 2 {
+	if len(samples) < 2 {
 		// Not enough history - assume no trend
 		return 0.0
 	}
 
-	// Simple trend: difference between most recent and oldest sample in window
-	oldest := entry.samples[0]
-	newest := entry.samples[len(entry.samples)-1]
-	timeDiff := newest.timestamp.Sub(oldest.timestamp).Seconds()
+	// slope is in saturation units per second
+	return slope(samples)
+}
 
-	if timeDiff < 0.001 {
-		// Samples too close together - return point-to-point delta
-		return newest.saturation - oldest.saturation
+// slope computes a linear regression using the least squares method
+func slope(samples []saturationSample) float64 {
+	// slope = (n*Σ(t*s) - Σ(t)*Σ(s)) / (n*Σ(t²) - (Σ(t))²)
+
+	n := float64(len(samples))
+	var tSum, sSum, tsSum, tsqrSum float64
+
+	// Use the oldest sample timestamp as t=0 reference point
+	t0 := samples[0].timestamp
+
+	for _, sample := range samples {
+		t := sample.timestamp.Sub(t0).Seconds() // time in seconds since oldest sample
+		s := sample.saturation
+		tSum += t
+		sSum += s
+		tsSum += t * s
+		tsqrSum += t * t
 	}
 
-	// Return rate of change in saturation units per second
-	delta := (newest.saturation - oldest.saturation) / timeDiff
-	return delta
+	denominator := n*tsqrSum - tSum*tSum
+	if denominator < 1e-10 {
+		// All samples at same time (or very close)
+		return 0.0
+	}
+
+	return (n*tsSum - tSum*sSum) / denominator
 }
 
 // following: lifted from locator.go

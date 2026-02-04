@@ -213,11 +213,11 @@ type Evictor interface {
 	//
 	// Parameters:
 	//   - ctx: Request context for logging, tracing
+	//   - candidate: The gated item to potentially evict
 	//   - queue: The queue containing the item (provides Remove capability)
-	//   - item: The gated item to potentially evict
 	//   - priority: The priority level of the item
 	//   - usageLimit: The usage limit that gated this item
-	ScheduleEvictionCandidate(ctx context.Context, queue EvictableQueue, item QueueItemAccessor, priority int, usageLimit float64)
+	ScheduleEvictionCandidate(ctx context.Context, candidate QueueItemAccessor, queue EvictableQueue, priority int, usageLimit float64)
 
 	// ProcessScheduled removes scheduled eviction candidates from their queues.
 	//

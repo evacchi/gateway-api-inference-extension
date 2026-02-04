@@ -18,6 +18,7 @@ package saturation
 
 import (
 	"context"
+	"slices"
 	"sync"
 
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/flowcontrol"
@@ -68,8 +69,8 @@ func (e *BatchEvictor) TypedName() plugin.TypedName {
 // Only items with negative priority (priority < 0) are scheduled.
 func (e *BatchEvictor) ScheduleEvictionCandidate(
 	ctx context.Context,
+	candidate flowcontrol.QueueItemAccessor,
 	queue flowcontrol.EvictableQueue,
-	item flowcontrol.QueueItemAccessor,
 	priority int,
 	usageLimit float64,
 ) {
@@ -83,7 +84,7 @@ func (e *BatchEvictor) ScheduleEvictionCandidate(
 
 	e.candidates = append(e.candidates, evictionCandidate{
 		queue:      queue,
-		item:       item,
+		item:       candidate,
 		priority:   priority,
 		usageLimit: usageLimit,
 	})
@@ -97,17 +98,13 @@ func (e *BatchEvictor) ProcessScheduled(ctx context.Context) (int, error) {
 
 	evicted := 0
 
-	// Evict in LIFO order (reverse iteration through candidates)
-	// This evicts most recently scheduled items first, minimizing wasted wait time
-	for i := len(e.candidates) - 1; i >= 0; i-- {
-		candidate := e.candidates[i]
-
+	// Evict in reverse order
+	for _, candidate := range slices.Backward(e.candidates) {
 		// Attempt to remove the item from its queue
 		if _, err := candidate.queue.Remove(candidate.item.Handle()); err != nil {
 			// Item may have already been dispatched or removed - not an error
 			continue
 		}
-
 		evicted++
 	}
 

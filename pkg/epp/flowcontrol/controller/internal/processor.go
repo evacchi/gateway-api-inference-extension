@@ -100,8 +100,8 @@ func NewShardProcessor(
 		shard:                shard,
 		saturationDetector:   saturationDetector,
 		podLocator:           podLocator,
-		usageLimitPolicy:     saturation.NewDynamicUsagePolicy(), // TODO: Make this configurable
-		evictor:              saturation.NewNoOpEvictor(),        // TODO: Make this configurable
+		usageLimitPolicy:     saturation.NewDynamicUsagePolicy(clock), // TODO: Make this configurable
+		evictor:              saturation.NewNoOpEvictor(),             // TODO: Make this configurable
 		clock:                clock,
 		cleanupSweepInterval: cleanupSweepInterval,
 		logger:               logger,
@@ -345,7 +345,7 @@ func (sp *ShardProcessor) dispatchCycle(ctx context.Context) bool {
 			if queue, err := sp.shard.ManagedQueue(req.FlowKey()); err != nil {
 				sp.logger.Error(err, "Failed to get ManagedQueue for eviction scheduling", "flowKey", req.FlowKey())
 			} else {
-				sp.evictor.ScheduleEvictionCandidate(ctx, queue, item, priority, usageLimit)
+				sp.evictor.ScheduleEvictionCandidate(ctx, item, queue, priority, usageLimit)
 			}
 			continue
 		}

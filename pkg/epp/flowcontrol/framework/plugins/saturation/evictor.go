@@ -50,7 +50,7 @@ func (e *NoOpEvictor) TypedName() plugin.TypedName {
 }
 
 // ScheduleEviction does nothing (no-op).
-func (e *NoOpEvictor) ScheduleEvictionCandidate(ctx context.Context, queue flowcontrol.EvictableQueue, item flowcontrol.QueueItemAccessor, priority int, usageLimit float64) {
+func (e *NoOpEvictor) ScheduleEvictionCandidate(ctx context.Context, candidate flowcontrol.QueueItemAccessor, queue flowcontrol.EvictableQueue, priority int, usageLimit float64) {
 	// No-op: don't schedule anything for eviction
 }
 

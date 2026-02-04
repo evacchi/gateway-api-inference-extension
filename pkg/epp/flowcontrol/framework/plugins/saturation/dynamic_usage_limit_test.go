@@ -21,22 +21,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+	testclock "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/metadata"
 )
 
 func TestDynamicUsagePolicy_InitialLimit(t *testing.T) {
-	policy := NewDynamicUsagePolicy()
+	policy := NewDynamicUsagePolicy(testclock.NewFakeClock(time.Now()))
 	ctx := context.Background()
 
 	// First call should return 1.0 (no limit)
 	limit := policy.ComputeLimit(ctx, 0, 0.5, nil)
-	if limit != 1.0 {
-		t.Errorf("Expected initial limit to be 1.0, got %f", limit)
-	}
+	require.Equal(t, 1.0, limit, "Expected initial limit to be 1.0, got %f", limit)
 }
 
 func TestDynamicUsagePolicy_ThrottleWhenOverTarget(t *testing.T) {
-	policy := NewDynamicUsagePolicy()
+	policy := NewDynamicUsagePolicy(testclock.NewFakeClock(time.Now()))
 	ctx := context.Background()
 
 	// Call once to establish baseline
@@ -44,13 +44,11 @@ func TestDynamicUsagePolicy_ThrottleWhenOverTarget(t *testing.T) {
 
 	// Saturation above target should reduce limit
 	limit := policy.ComputeLimit(ctx, 0, 0.95, nil)
-	if limit >= 1.0 {
-		t.Errorf("Expected limit to decrease when saturation > target, got %f", limit)
-	}
+	require.Lessf(t, limit, 1.0, "Expected limit to decrease when saturation > target, got %f", limit)
 }
 
 func TestDynamicUsagePolicy_RecoverWhenUnderTarget(t *testing.T) {
-	policy := NewDynamicUsagePolicy()
+	policy := NewDynamicUsagePolicy(testclock.NewFakeClock(time.Now()))
 	ctx := context.Background()
 
 	// First, get saturation high to reduce limit
@@ -60,14 +58,14 @@ func TestDynamicUsagePolicy_RecoverWhenUnderTarget(t *testing.T) {
 	// Now drop saturation below target
 	limitAfterLow := policy.ComputeLimit(ctx, 0, 0.3, nil)
 
-	if limitAfterLow <= limitAfterHigh {
-		t.Errorf("Expected limit to increase when saturation drops below target, high=%f, low=%f",
-			limitAfterHigh, limitAfterLow)
-	}
+	require.Greaterf(t, limitAfterLow, limitAfterHigh,
+		"Expected limit to increase when saturation drops below target, high=%f, low=%f",
+		limitAfterHigh, limitAfterLow)
+
 }
 
 func TestDynamicUsagePolicy_ProportionalAdjustment(t *testing.T) {
-	policy := NewDynamicUsagePolicy()
+	policy := NewDynamicUsagePolicy(testclock.NewFakeClock(time.Now()))
 	ctx := context.Background()
 
 	// Establish baseline
@@ -78,35 +76,34 @@ func TestDynamicUsagePolicy_ProportionalAdjustment(t *testing.T) {
 	limitSmallOvershoot := policy.ComputeLimit(ctx, 1, 0.85, nil)
 
 	// Start fresh for large overshoot
-	policy2 := NewDynamicUsagePolicy()
+	policy2 := NewDynamicUsagePolicy(testclock.NewFakeClock(time.Now()))
 	policy2.ComputeLimit(ctx, 1, 0.5, nil)
 	policy2.ComputeLimit(ctx, 1, 0.99, nil)
 	limitLargeOvershoot := policy2.ComputeLimit(ctx, 1, 0.99, nil)
 
 	// Larger overshoot should result in more aggressive throttling
-	if limitLargeOvershoot >= limitSmallOvershoot {
-		t.Errorf("Expected larger overshoot to throttle more aggressively, small=%f, large=%f",
-			limitSmallOvershoot, limitLargeOvershoot)
-	}
+	require.Lessf(t, limitLargeOvershoot, limitSmallOvershoot,
+		"Expected larger overshoot to throttle more aggressively, small=%f, large=%f",
+		limitSmallOvershoot, limitLargeOvershoot)
 }
 
 func TestDynamicUsagePolicy_TrendBasedAdjustment(t *testing.T) {
-	policy := NewDynamicUsagePolicy()
+	policy := NewDynamicUsagePolicy(testclock.NewFakeClock(time.Now()))
 	ctx := context.Background()
 
 	// Create a rising trend
 	policy.ComputeLimit(ctx, 1, 0.85, nil)
-	time.Sleep(100 * time.Millisecond)
+	policy.clock.Sleep(100 * time.Millisecond)
 	policy.ComputeLimit(ctx, 1, 0.90, nil)
-	time.Sleep(100 * time.Millisecond)
+	policy.clock.Sleep(100 * time.Millisecond)
 	limitRising := policy.ComputeLimit(ctx, 1, 0.95, nil)
 
 	// Create a stable/falling trend
-	policy2 := NewDynamicUsagePolicy()
+	policy2 := NewDynamicUsagePolicy(testclock.NewFakeClock(time.Now()))
 	policy2.ComputeLimit(ctx, 1, 0.95, nil)
-	time.Sleep(100 * time.Millisecond)
+	policy.clock.Sleep(100 * time.Millisecond)
 	policy2.ComputeLimit(ctx, 1, 0.90, nil)
-	time.Sleep(100 * time.Millisecond)
+	policy.clock.Sleep(100 * time.Millisecond)
 	limitFalling := policy2.ComputeLimit(ctx, 1, 0.85, nil)
 
 	// Rising trend should throttle more aggressively than falling trend
@@ -117,7 +114,7 @@ func TestDynamicUsagePolicy_TrendBasedAdjustment(t *testing.T) {
 }
 
 func TestDynamicUsagePolicy_PriorityScaling(t *testing.T) {
-	policy := NewDynamicUsagePolicy()
+	policy := NewDynamicUsagePolicy(testclock.NewFakeClock(time.Now()))
 	ctx := context.Background()
 
 	// Establish baseline for both priorities
@@ -132,14 +129,12 @@ func TestDynamicUsagePolicy_PriorityScaling(t *testing.T) {
 	limitLowPriority := policy.ComputeLimit(ctx, -10, 0.95, nil)
 
 	// Low priority should be throttled more aggressively
-	if limitLowPriority >= limitHighPriority {
-		t.Errorf("Expected low priority to be throttled more aggressively, high=%f, low=%f",
-			limitHighPriority, limitLowPriority)
-	}
+	require.Less(t, limitLowPriority, limitHighPriority, "Expected low priority to be throttled more aggressively, high=%f, low=%f",
+		limitHighPriority, limitLowPriority)
 }
 
 func TestDynamicUsagePolicy_DecayMechanism(t *testing.T) {
-	policy := NewDynamicUsagePolicy()
+	policy := NewDynamicUsagePolicy(testclock.NewFakeClock(time.Now()))
 	ctx := context.Background()
 
 	// Reduce limit by saturating
@@ -148,19 +143,18 @@ func TestDynamicUsagePolicy_DecayMechanism(t *testing.T) {
 	limitBeforeIdle := policy.ComputeLimit(ctx, 0, 0.95, nil)
 
 	// Wait for idle threshold to pass
-	time.Sleep(idleTimeThreshold + 100*time.Millisecond)
+	policy.clock.Sleep(idleTimeThreshold + 100*time.Millisecond)
 
 	// Compute limit again - should apply decay
-	limitAfterIdle := policy.ComputeLimit(ctx, 0, 0.95, nil)
+	limitAfterIdle := policy.ComputeLimit(ctx, 0, 0.5, nil)
 
-	if limitAfterIdle <= limitBeforeIdle {
-		t.Errorf("Expected limit to increase after idle period due to decay, before=%f, after=%f",
-			limitBeforeIdle, limitAfterIdle)
-	}
+	require.Greaterf(t, limitAfterIdle, limitBeforeIdle,
+		"Expected limit to increase after idle period due to decay, before=%f, after=%f",
+		limitBeforeIdle, limitAfterIdle)
 }
 
 func TestDynamicUsagePolicy_LimitClamping(t *testing.T) {
-	policy := NewDynamicUsagePolicy()
+	policy := NewDynamicUsagePolicy(testclock.NewFakeClock(time.Now()))
 	ctx := context.Background()
 
 	// Try to push limit above 1.0 by having very low saturation repeatedly
@@ -169,24 +163,20 @@ func TestDynamicUsagePolicy_LimitClamping(t *testing.T) {
 	}
 	limit := policy.ComputeLimit(ctx, 0, 0.0, nil)
 
-	if limit > 1.0 {
-		t.Errorf("Expected limit to be clamped at 1.0, got %f", limit)
-	}
+	require.LessOrEqualf(t, limit, 1.0, "Expected limit to be clamped at 1.0, got %f", limit)
 
 	// Try to push limit below 0.0 by having very high saturation repeatedly
-	policy2 := NewDynamicUsagePolicy()
+	policy2 := NewDynamicUsagePolicy(testclock.NewFakeClock(time.Now()))
 	for i := 0; i < 50; i++ {
 		policy2.ComputeLimit(ctx, 0, 1.0, nil)
 	}
 	limit = policy2.ComputeLimit(ctx, 0, 1.0, nil)
 
-	if limit < 0.0 {
-		t.Errorf("Expected limit to be clamped at 0.0, got %f", limit)
-	}
+	require.GreaterOrEqualf(t, limit, 0.0, "Expected limit to be clamped at 0.0, got %f", limit)
 }
 
 func TestDynamicUsagePolicy_EndpointSubsetTracking(t *testing.T) {
-	policy := NewDynamicUsagePolicy()
+	policy := NewDynamicUsagePolicy(testclock.NewFakeClock(time.Now()))
 	ctx := context.Background()
 
 	// Create metadata for two different endpoint subsets
@@ -209,7 +199,7 @@ func TestDynamicUsagePolicy_EndpointSubsetTracking(t *testing.T) {
 	// Subset A experiences high saturation
 	for i := 0; i < 5; i++ {
 		policy.ComputeLimit(ctx, 0, 0.95, metadataSubsetA)
-		time.Sleep(10 * time.Millisecond)
+		policy.clock.Sleep(10 * time.Millisecond)
 	}
 
 	// Subset B remains at low saturation
@@ -217,17 +207,16 @@ func TestDynamicUsagePolicy_EndpointSubsetTracking(t *testing.T) {
 
 	// KNOWN LIMITATION: Both subsets share the same limit for priority 0
 	// Even though subset B has low saturation, it gets the same throttled limit as subset A
-	if limitSubsetB >= 0.9 {
-		t.Logf("UNEXPECTED: Subset B with low saturation has high limit: %f", limitSubsetB)
-		t.Logf("This suggests limits might be per-(priority, subset) rather than per-priority")
-	} else {
-		t.Logf("KNOWN LIMITATION: Subset B is unnecessarily throttled (limit=%f) because it shares", limitSubsetB)
-		t.Logf("the same limit with Subset A at priority 0. Limits are per-priority, not per-(priority, subset).")
-	}
+	require.Lessf(t, limitSubsetB, 0.9,
+		"UNEXPECTED: Subset B with low saturation has high limit: %f. "+
+			"This suggests limits might be per-(priority, subset) rather than per-priority", limitSubsetB)
+
+	t.Logf("KNOWN LIMITATION: Subset B is unnecessarily throttled (limit=%f) because it shares", limitSubsetB)
+	t.Logf("the same limit with Subset A at priority 0. Limits are per-priority, not per-(priority, subset).")
 }
 
-func TestDynamicUsagePolicy_DifferentEndpointSubsetsHaveDifferentDeltas(t *testing.T) {
-	policy := NewDynamicUsagePolicy()
+func TestDynamicUsagePolicy_DifferentEndpointSubsetsHaveDifferentSlopes(t *testing.T) {
+	policy := NewDynamicUsagePolicy(testclock.NewFakeClock(time.Now()))
 	ctx := context.Background()
 
 	metadataSubsetA := map[string]any{
@@ -244,32 +233,42 @@ func TestDynamicUsagePolicy_DifferentEndpointSubsetsHaveDifferentDeltas(t *testi
 
 	// Subset A: rising saturation
 	policy.ComputeLimit(ctx, 0, 0.5, metadataSubsetA)
-	time.Sleep(100 * time.Millisecond)
+	policy.clock.Sleep(100 * time.Millisecond)
 	policy.ComputeLimit(ctx, 0, 0.7, metadataSubsetA)
-	time.Sleep(100 * time.Millisecond)
+	policy.clock.Sleep(100 * time.Millisecond)
 	policy.ComputeLimit(ctx, 0, 0.9, metadataSubsetA)
 
 	// Subset B: stable saturation
 	policy.ComputeLimit(ctx, 0, 0.5, metadataSubsetB)
-	time.Sleep(100 * time.Millisecond)
+	policy.clock.Sleep(100 * time.Millisecond)
 	policy.ComputeLimit(ctx, 0, 0.5, metadataSubsetB)
-	time.Sleep(100 * time.Millisecond)
+	policy.clock.Sleep(100 * time.Millisecond)
 	policy.ComputeLimit(ctx, 0, 0.5, metadataSubsetB)
 
-	// The deltas for the two subsets should be tracked independently
-	// This test mainly verifies no panics/errors occur with separate tracking
-	t.Logf("Successfully tracked separate saturation trends for different endpoint subsets")
-}
+	keyA := generateCacheKey(metadataSubsetA)
+	keyB := generateCacheKey(metadataSubsetB)
+	require.NotEqual(t, keyA, keyB, "Different subsets should have different cache keys")
 
-func TestDynamicUsagePolicy_TypedName(t *testing.T) {
-	policy := NewDynamicUsagePolicy()
-	typedName := policy.TypedName()
+	samplesA := policy.saturations[keyA]
+	samplesB := policy.saturations[keyB]
+	require.NotEmpty(t, samplesA, "Subset A should have saturation samples")
+	require.NotEmpty(t, samplesB, "Subset B should have saturation samples")
 
-	if typedName.Type != DynamicUsageLimitPolicyType {
-		t.Errorf("Expected type %s, got %s", DynamicUsageLimitPolicyType, typedName.Type)
-	}
+	// Slopes show trends are computed independently
+	slopeA := slope(samplesA)
+	slopeB := slope(samplesB)
+	require.Greater(t, slopeA, 0.0, "Subset A should have positive trend (rising: 0.5→0.7→0.9)")
+	require.InDelta(t, 0.0, slopeB, 0.01, "Subset B should have near-zero trend (stable: 0.5→0.5→0.5)")
 
-	if typedName.Name != DynamicUsageLimitPolicyType {
-		t.Errorf("Expected name %s, got %s", DynamicUsageLimitPolicyType, typedName.Name)
-	}
+	// Part 2: Demonstrate that limits CLASH when using same priority
+	// Even though trends differ, the second call overwrites the first's limit
+	limitA := policy.ComputeLimit(ctx, 0, 0.85, metadataSubsetA) // Rising trend → aggressive throttle
+	limitB := policy.ComputeLimit(ctx, 0, 0.85, metadataSubsetB) // Stable trend → gentler throttle
+
+	// KNOWN LIMITATION: limitB should be higher (less aggressive), but they may not reflect
+	// independent trends because limits are per-priority (the second call overwrites the first)
+	t.Logf("KNOWN LIMITATION: Different items in the same band may produce different usage limits")
+	t.Logf("Limit A (rising trend): %f", limitA)
+	t.Logf("Limit B (stable trend): %f", limitB)
+	require.NotEqual(t, limitA, limitB)
 }
