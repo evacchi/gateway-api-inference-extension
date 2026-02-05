@@ -45,6 +45,10 @@ var (
 var (
 	// ErrQueueAtCapacity indicates that a request could not be enqueued because queue capacity limits were met.
 	ErrQueueAtCapacity = errors.New("queue at capacity")
+
+	// ErrSaturated indicates that a request could not be enqueued because target endpoints are saturated
+	// beyond the usage limit policy threshold.
+	ErrSaturated = errors.New("target endpoints saturated")
 )
 
 // --- Post-Enqueue Eviction Errors ---

@@ -202,7 +202,7 @@ func (sp *ShardProcessor) Run(ctx context.Context) {
 				sp.logger.Error(nil, "Logic error: nil item received on shard processor enqueue channel, ignoring.")
 				continue
 			}
-			sp.enqueue(item)
+			sp.enqueue(ctx, item)
 			sp.dispatchCycle(ctx) // Process immediately when an item arrives
 		case <-dispatchTicker.C():
 			sp.dispatchCycle(ctx) // Periodically attempt to dispatch from queues
@@ -212,7 +212,7 @@ func (sp *ShardProcessor) Run(ctx context.Context) {
 
 // enqueue processes an item received from the enqueueChan.
 // It handles capacity checks, checks for external finalization, and either admits the item to a queue or rejects it.
-func (sp *ShardProcessor) enqueue(item *FlowItem) {
+func (sp *ShardProcessor) enqueue(ctx context.Context, item *FlowItem) {
 	req := item.OriginalRequest()
 	key := req.FlowKey()
 
@@ -250,6 +250,22 @@ func (sp *ShardProcessor) enqueue(item *FlowItem) {
 			"flowKey", key, "reqID", req.ID(), "priorityName", band.PriorityName(), "reqByteSize", req.ByteSize())
 		item.FinalizeWithOutcome(types.QueueOutcomeRejectedCapacity, fmt.Errorf("%w: %w",
 			types.ErrRejected, types.ErrQueueAtCapacity))
+		return
+	}
+
+	// --- Admission Policy Check (Saturation-based) ---
+	// Check if target endpoints are saturated beyond the usage limit threshold.
+	// This prevents queueing requests that will be immediately evicted during dispatch.
+	candidates := sp.podLocator.Locate(ctx, req.GetMetadata())
+	saturation := sp.saturationDetector.Saturation(ctx, candidates)
+	usageLimit := sp.usageLimitPolicy.ComputeLimit(ctx, key.Priority, saturation, req.GetMetadata())
+
+	if saturation >= usageLimit {
+		sp.logger.V(logutil.DEBUG).Info("Rejecting request, target endpoints saturated beyond usage limit",
+			"flowKey", key, "reqID", req.ID(), "priorityName", band.PriorityName(),
+			"saturation", saturation, "usageLimit", usageLimit)
+		item.FinalizeWithOutcome(types.QueueOutcomeRejectedOther, fmt.Errorf("%w: %w",
+			types.ErrRejected, types.ErrSaturated))
 		return
 	}
 

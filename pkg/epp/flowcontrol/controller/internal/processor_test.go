@@ -636,7 +636,7 @@ func TestShardProcessor(t *testing.T) {
 					if item == nil {
 						item = h.newTestItem("req-enqueue-test", testFlow, testTTL)
 					}
-					h.processor.enqueue(item)
+					h.processor.enqueue(h.ctx, item)
 					tc.assert(t, h, item)
 				})
 			}
