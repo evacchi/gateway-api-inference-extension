@@ -303,6 +303,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 		fc, err := fccontroller.NewFlowController(
 			ctx,
+			opts.PoolName,
 			eppConfig.FlowControlConfig.Controller,
 			registry, saturationDetector,
 			locator,
