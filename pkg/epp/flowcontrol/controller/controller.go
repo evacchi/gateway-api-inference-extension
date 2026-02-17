@@ -217,6 +217,7 @@ func (fc *FlowController) EnqueueAndWait(
 	ctx context.Context,
 	req flowcontrol.FlowControlRequest,
 ) (types.QueueOutcome, error) {
+	fc.logger.Info("DEBUG: EnqueueAndWait called", "requestID", req.ID())
 	flowKey := req.FlowKey()
 	priority := strconv.Itoa(flowKey.Priority)
 	reqBytes := req.ByteSize()
@@ -509,7 +510,7 @@ func (fc *FlowController) getOrStartWorker(shard contracts.RegistryShard) *manag
 	}
 
 	// We won the race. The newWorker was stored. Now, start the processor's long-running goroutine.
-	fc.logger.V(logutil.DEFAULT).Info("Starting new ShardProcessor worker.", "shardID", shard.ID())
+	fc.logger.Info("DEBUG: Starting new ShardProcessor worker.", "shardID", shard.ID())
 	fc.wg.Add(1)
 	go func() {
 		defer fc.wg.Done()

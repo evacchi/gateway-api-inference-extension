@@ -166,8 +166,8 @@ func (sp *ShardProcessor) SubmitOrBlock(ctx context.Context, item *FlowItem) err
 // It uses a `select` statement to interleave accepting new requests with dispatching existing ones, balancing
 // responsiveness with throughput.
 func (sp *ShardProcessor) Run(ctx context.Context) {
-	sp.logger.V(logutil.DEFAULT).Info("Shard processor run loop starting.")
-	defer sp.logger.V(logutil.DEFAULT).Info("Shard processor run loop stopped.")
+	sp.logger.Info("DEBUG: Shard processor run loop starting.")
+	defer sp.logger.Info("DEBUG: Shard processor run loop stopped.")
 
 	sp.wg.Add(1)
 	go sp.runCleanupSweep(ctx)
@@ -319,6 +319,7 @@ func (sp *ShardProcessor) dispatchCycle(ctx context.Context) bool {
 
 	// Record pool saturation metric
 	metrics.RecordFlowControlPoolSaturation(sp.poolName, saturation)
+	sp.logger.Info("DEBUG: dispatchCycle called", "poolName", sp.poolName, "saturation", saturation, "poolSize", len(pool))
 
 	for _, priority := range sp.shard.AllOrderedPriorityLevels() {
 		originalBand, err := sp.shard.PriorityBandAccessor(priority)
